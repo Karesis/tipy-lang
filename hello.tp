@@ -1,0 +1,4 @@
+// hello.tp
+main() {
+    print("Hello, Tipy World!")
+}

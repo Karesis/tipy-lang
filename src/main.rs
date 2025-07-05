@@ -1,11 +1,21 @@
-// src/main.rs
+mod lexer;
+mod ast;
+mod parser;
+mod codegen;
 
 use std::fs;
-use clap::Parser;
-// ... 我们很快会在这里加上 logos, chumsky 等的 use 声明
+use clap::Parser as ClapParser;
+use logos::Logos;
+// 【已修正】引入 Stream
+use chumsky::{Parser, Stream};
+use inkwell::context::Context;
+
+use crate::lexer::Token;
+use crate::parser::program_parser;
+use crate::codegen::CodeGen;
 
 /// Tipy 语言的简易编译器
-#[derive(Parser, Debug)]
+#[derive(ClapParser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// 需要被编译的 .tp 文件路径
@@ -23,18 +33,46 @@ fn main() {
         }
     };
 
-    // --- 编译器流水线 ---
-    // 1. 词法分析
-    println!("(1) 正在进行词法分析...");
-    // TODO: 使用 `logos` 将 `source_code` 转换为 Token 流
+    let lexer = Token::lexer(&source_code);
+    let tokens: Vec<_> = lexer.spanned()
+        .filter_map(|(token, span)| token.ok().map(|t| (t, span)))
+        .collect();
 
-    // 2. 语法分析
-    println!("(2) 正在进行语法分析...");
-    // TODO: 使用 `chumsky` 解析 Token 流，生成 AST
-
-    // 3. 语义分析与代码生成
-    println!("(3) 正在生成 LLVM IR...");
-    // TODO: 遍历 AST，使用 `inkwell` 生成 LLVM IR
+    // 【核心修正】显式创建 Stream 对象
+    // 我们需要告诉 Stream 输入流的结尾在哪里，这里就是 tokens 的长度
+    let token_stream = Stream::from_iter(tokens.len()..tokens.len() + 1, tokens.into_iter());
+    let (ast, parse_errors) = program_parser().parse_recovery(token_stream);
     
-    println!("\n编译成功! (模拟)");
+    if !parse_errors.is_empty() {
+        println!("语法分析失败，产生 {} 个错误:", parse_errors.len());
+        for error in parse_errors {
+            println!("- {:?}", error);
+        }
+        return;
+    }
+
+    let program_ast = if let Some(ast) = ast {
+        ast
+    } else {
+        println!("严重错误: AST 未能生成。");
+        return;
+    };
+    println!("AST 生成成功!");
+    
+    println!("\n(3) 正在生成 LLVM IR...");
+    let context = Context::create();
+    let mut codegen = CodeGen::new(&context, "tipy_module");
+    
+    match codegen.compile(program_ast) {
+        Ok(llvm_ir) => {
+            println!("LLVM IR 生成成功:\n");
+            println!("{}", llvm_ir);
+            
+            fs::write("output.ll", llvm_ir).expect("无法写入 output.ll");
+            println!("\nLLVM IR 已写入 output.ll 文件。");
+        }
+        Err(e) => {
+            println!("代码生成失败: {}", e);
+        }
+    }
 }
