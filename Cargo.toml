@@ -4,4 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# 命令行解析
+clap = { version = "4.5.4", features = ["derive"] }
+
+# 词法分析
+logos = "0.15.0"
+
+# 语法分析
+chumsky = "0.10.1"
+
+# 代码生成
 inkwell = { version = "0.6.0", features = ["llvm18-1"] }
