@@ -27,6 +27,7 @@ impl<'a> Lexer<'a> {
             b')' => Token::RParen,
             b'{' => Token::LBrace,
             b'}' => Token::RBrace,
+            b',' => Token::Comma,
             b'"' => self.read_string(), 
             0 => Token::Eof, // 0 (NUL) 代表文件结束
             _ => {
@@ -102,7 +103,7 @@ fn lookup_ident(ident: &str) -> Token {
     match ident {
         "main" => Token::Keyword(Keyword::Main),
         "print" => Token::Keyword(Keyword::Print),
-        _ => Token::Identifier((ident.to_string())),
+        _ => Token::Identifier(ident.to_string()),
     }
 }
 
