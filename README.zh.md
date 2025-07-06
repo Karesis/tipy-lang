@@ -120,4 +120,4 @@ entry:
 
 ## 📝 许可 (License)
 
-本项目采用 [MIT 许可证](LICENSE.md)授权。
+本项目采用 [Apache-2.0 许可证](LICENSE.md)授权。
