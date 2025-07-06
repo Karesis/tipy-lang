@@ -44,6 +44,12 @@ impl<'ctx> CodeGen<'ctx> {
         println!("---------------");
     }
 
+    pub fn save_ir_to_file(&self, path: &std::path::Path) -> Result<(), &'static str> {
+        self.module
+            .print_to_file(path)
+            .map_err(|_| "Error writing IR to file")
+    }
+
     fn declare_externs(&mut self) {
         // 对于 v0.0.1，我们只需要 C 标准库中的 `puts` 函数
         // `puts` 接收一个 `char*` 指针，返回一个 `i32`。
@@ -89,11 +95,17 @@ impl<'ctx> CodeGen<'ctx> {
         }
     
         // 3. 为我们的 `main` 函数创建函数类型 `fn() -> ()`
-        let void_type = self.context.void_type();
-        let fn_type = void_type.fn_type(&[], false);
-    
-        // 4. 在当前模块中添加这个函数
-        let function = self.module.add_function(fn_name, fn_type, None);
+        let function = if fn_name == "main" {
+            // main 函数返回 i32
+            let i32_type = self.context.i32_type();
+            let fn_type = i32_type.fn_type(&[], false);
+            self.module.add_function(fn_name, fn_type, None)
+        } else {
+            // 其他函数暂时返回 void
+            let void_type = self.context.void_type();
+            let fn_type = void_type.fn_type(&[], false);
+            self.module.add_function(fn_name, fn_type, None)
+        };
         
         // 5. 创建函数体的入口基本块 (BasicBlock)
         let entry_block = self.context.append_basic_block(function, "entry");
@@ -107,6 +119,15 @@ impl<'ctx> CodeGen<'ctx> {
         // 8. 编译函数体内的所有语句
         for stmt in body {
             self.compile_statement(stmt)?;
+        }
+
+        if fn_name == "main" {
+            // main 函数返回 0
+            let i32_type = self.context.i32_type();
+            self.builder.build_return(Some(&i32_type.const_int(0, false)))?;
+        } else {
+            // 其他函数返回 void
+            self.builder.build_return(None)?;
         }
     
         Ok(())
