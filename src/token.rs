@@ -4,9 +4,12 @@ pub enum Keyword {
     Print
 }
 
+// 字面量
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     String(String),
+    Integer(i64),
+    Float(f64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,4 +26,14 @@ pub enum Token {
     LBrace,  // {
     RBrace,  // }
     Comma,   // ,
+
+    Equal,      // =
+    Plus,       // +
+    Minus,      // -
+    Star,       // *
+    Slash,      // /
+    
+    Tilde,      // ~ (可变性标记)
+    Colon,      // :
+    Semicolon,  // ; (如果想把多行写道一起)
 }

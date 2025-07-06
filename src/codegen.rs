@@ -50,6 +50,8 @@ impl<'ctx> CodeGen<'ctx> {
             .map_err(|_| "Error writing IR to file")
     }
 
+    // 私有函数
+
     fn declare_externs(&mut self) {
         // 对于 v0.0.1，我们只需要 C 标准库中的 `puts` 函数
         // `puts` 接收一个 `char*` 指针，返回一个 `i32`。
@@ -79,6 +81,10 @@ impl<'ctx> CodeGen<'ctx> {
                 // TODO: 调用表达式编译的逻辑
                 self.compile_expression(expr).map(|_| ()) // 丢弃表达式的值
             },
+            Statement::VarDeclaration { .. } => {
+                // 我们告诉编译器：“我知道有这个情况，但后端逻辑还没写，先留个待办事项”
+                todo!("Implement compilation for variable declarations");
+            }
         }
     }
 
@@ -143,9 +149,8 @@ impl<'ctx> CodeGen<'ctx> {
                     .as_pointer_value()
                     .into())
             },
-    
-            // 在 compile_expression 的 match 语句中
 
+            // 处理函数调用
             Expression::Call { function, arguments } => {
                 // 步骤 1：使用 map + collect，一次性处理完所有参数的编译。
                 // 这就像是把所有零件的蓝图先画好，放进一个叫 `compiled_args` 的 Vec 里。
