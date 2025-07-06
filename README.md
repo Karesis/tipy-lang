@@ -120,4 +120,4 @@ Contributions of all kinds are welcome! Whether it's submitting issues, fixing b
 
 ## 📝 License
 
-This project is licensed under the [Apache-2.0 License](LICENSE.md).
+This project is licensed under the [Apache-2.0 License](LICENSE).
