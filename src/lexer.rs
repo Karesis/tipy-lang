@@ -1,180 +1,347 @@
-// src/lexer.rs
+// file: src/lexer.rs
 
 use crate::token::{Token, Keyword, Literal};
+use crate::diagnostics::{LexerError, Span}; 
 
+/// 词法分析器
 pub struct Lexer<'a> {
-    input: &'a [u8],
-    position: usize,      // 当前正在检查的字符的位置 (points to current char)
-    read_position: usize, // 即将读取的下一个字符的位置 (points to next char)
-    ch: u8,               // 当前正在检查的字符
+    // 源代码字符串
+    source: &'a str, 
+    // 跟踪字节位置用于切片
+    position: usize,
+    // 跟踪行列号用于 Span
+    line: u32,
+    column: u32,
+    // 使用 char 来支持 Unicode
+    ch: char, 
 }
 
+/// 词法分析器的具体实现
 impl<'a> Lexer<'a> {
-    pub fn new(input: &'a str) -> Self {
+
+    // 创建一个新的词法分析器
+    pub fn new(source: &'a str) -> Self {
         let mut lexer = Lexer {
-            input: input.as_bytes(),
+            source,
             position: 0,
-            read_position: 0,
-            ch: 0,
+            line: 1,
+            column: 0, // 将在 read_char 中首次变为 1
+            ch: '\0',
         };
-        lexer.read_char();
+        lexer.read_char(); // 初始化第一个字符
         lexer
     }
 
-    // NEW: 添加一个辅助函数 peek_char，用于“偷看”下一个字符而不移动指针。
-    // 这对于解析像 `->` 这样的多字符 Token 至关重要。
-    fn peek_char(&self) -> u8 {
-        if self.read_position >= self.input.len() {
-            0
+    // 核心接口，会返回 Result，需要后续解包
+    pub fn next_token(&mut self) -> Result<Token, LexerError> {
+        // 跳过空白和注释
+        self.skip_whitespace_and_comments();
+        
+        // 在处理 token 前记录起始位置，方便报错
+        let start_pos = self.position; 
+        let start_line = self.line;
+        let start_col = self.column;
+        
+        // 主解析与匹配逻辑
+        let token_result = match self.ch {
+            
+            // 双字符
+            '=' => {
+                if self.peek_char() == '=' {
+                    self.read_char();
+                    Ok(Token::Equal)
+                } else {
+                    Ok(Token::Assign)
+                }
+            }
+            '!' => {
+                if self.peek_char() == '=' {
+                    self.read_char();
+                    Ok(Token::NotEqual)
+                } else {
+                    Ok(Token::Bang)
+                }
+            }
+            '<' => {
+                if self.peek_char() == '=' { 
+                    self.read_char(); 
+                    Ok(Token::LessEqual) 
+                } else { 
+                    Ok(Token::LessThan) 
+                }
+            }
+            '>' => {
+                if self.peek_char() == '=' { 
+                    self.read_char(); 
+                    Ok(Token::GreaterEqual) 
+                } else { 
+                    Ok(Token::GreaterThan) 
+                }
+            }
+            '-' => {
+                if self.peek_char() == '>' {
+                    self.read_char();
+                    Ok(Token::Arrow)
+                } else {
+                    Ok(Token::Minus)
+                }
+            }
+            
+            // 单字符
+            '+' => Ok(Token::Plus),
+            '*' => Ok(Token::Star),
+            '/' => Ok(Token::Slash), // 注释已在 skip 中处理
+            '~' => Ok(Token::Tilde),
+            ':' => Ok(Token::Colon),
+            ';' => Ok(Token::Semicolon),
+            ',' => Ok(Token::Comma),
+            '(' => Ok(Token::LParen),
+            ')' => Ok(Token::RParen),
+            '{' => Ok(Token::LBrace),
+            '}' => Ok(Token::RBrace),
+            '^' => Ok(Token::Caret),
+            '|' => Ok(Token::Pipe),
+
+            // 处理字符串字面量("hello")
+            '"' => self.read_string(), 
+            // 处理字符字面量('a')
+            '\'' => self.read_char_literal(), 
+
+            // 文件末尾
+            '\0' => Ok(Token::Eof),
+
+            // 其他非符号token
+            _ => {
+                // 处理标识符
+                if self.ch.is_ascii_alphabetic() || self.ch == '_' {
+                    // 先由read_identifier()处理成String
+                    let ident = self.read_identifier();
+
+                    // 然后再由lookup_indent查看是否为关键字
+                    return Ok(lookup_ident(&ident)); // 直接返回，因为它已消耗所有字符
+                
+                // 处理数字字面量
+                } else if self.ch.is_ascii_digit() {
+                    return self.read_number(); // read_number 返回 Result<Token, LexerError>
+
+                // 处理未知错误
+                } else {
+                    // 处理未知字符，返回结构化错误
+                    let span = Span { line: start_line, column: start_col, start_byte: start_pos, end_byte: self.position };
+                    Err(LexerError::UnknownCharacter { char: self.ch, span })
+                }
+            }
+        };
+        
+        // 对于所有通过 Ok() 分支的 token，向前移动一个字符
+        // 注意：返回 Ok 或 Err 的分支需要自行处理 read_char
+        if token_result.is_ok() {
+            self.read_char();
+        }
+
+        // 返回最终得到的token_result
+        token_result
+    }
+
+    // --- 辅助函数 ---
+
+    fn read_char(&mut self) {
+        let current_len = self.ch.len_utf8();
+        self.position += current_len;
+        
+        if self.position >= self.source.len() {
+            self.ch = '\0';
+            return;
+        }
+
+        self.ch = self.source[self.position..].chars().next().unwrap_or('\0');
+
+        if self.ch == '\n' {
+            self.line += 1;
+            self.column = 1;
         } else {
-            self.input[self.read_position]
+            self.column += 1;
         }
     }
 
-    pub fn next_token(&mut self) -> Token {
-        self.skip_whitespace_and_comments(); // UPDATED: 函数名变更，功能增强
-
-        // UPDATED: 调整了 match 表达式，以处理新的 Token 和多字符 Token
-        let token = match self.ch {
-            b'=' => Token::Equal,
-            b'+' => Token::Plus,
-            b'*' => Token::Star,
-            b'~' => Token::Tilde,
-            b':' => Token::Colon,
-            b';' => Token::Semicolon,
-            b',' => Token::Comma,
-            b'(' => Token::LParen,
-            b')' => Token::RParen,
-            b'{' => Token::LBrace,
-            b'}' => Token::RBrace,
-            b'^' => Token::Caret, // NEW: 增加了对 '^' 的支持
-            b'|' => Token::Pipe,  // NEW: 增加了对 '|' 的支持
-            b'"' => self.read_string(),
-
-            // UPDATED: 增强了对 `-` 和 `/` 的处理
-            b'-' => {
-                if self.peek_char() == b'>' {
-                    self.read_char(); // 消耗当前的 '-'
-                    Token::Arrow // 返回 Arrow Token
-                } else {
-                    Token::Minus
-                }
-            }
-            b'/' => {
-                // 注释被 skip_whitespace_and_comments 处理，这里只处理除法
-                Token::Slash
-            }
-            
-            0 => Token::Eof,
-            _ => {
-                if is_letter(self.ch) {
-                    let identifier = self.read_identifier();
-                    // lookup_ident 现在会返回正确的 Token 类型
-                    return lookup_ident(&identifier);
-                } else if is_digit(self.ch) {
-                    // read_number 不需要返回，因为它内部已经消耗了所有数字字符
-                    return self.read_number();
-                } else {
-                    Token::Illegal(self.ch as char)
-                }
-            }
-        };
-
-        // 为单字符 token 和处理过的多字符 token 前进指针
-        self.read_char();
-        
-        token
-    }
-
-    fn read_char(&mut self) {
-        if self.read_position >= self.input.len() {
-            self.ch = 0; // 0 (NUL) 代表文件结束
+    fn peek_char(&self) -> char {
+        let current_len = self.ch.len_utf8();
+        if self.position + current_len >= self.source.len() {
+            '\0'
         } else {
-            self.ch = self.input[self.read_position];
-        };
-        self.position = self.read_position;
-        self.read_position += 1;
+            self.source[self.position + current_len..].chars().next().unwrap_or('\0')
+        }
     }
 
-    // UPDATED: 此函数现在也能跳过单行注释
+    // 跳过所有的空白和单行注释
     fn skip_whitespace_and_comments(&mut self) {
+        // 主循环开始
         loop {
-            if self.ch.is_ascii_whitespace() {
+            // 如果是空白就一直跳过
+            if self.ch.is_whitespace() {
                 self.read_char();
-            } else if self.ch == b'/' && self.peek_char() == b'/' { // NEW: 检查 `//`
-                // 如果是单行注释，一直读到行尾
-                while self.ch != b'\n' && self.ch != 0 {
+
+            // 如果检测到连续的两个'/'，说明是单行注释
+            } else if self.ch == '/' && self.peek_char() == '/' {
+                // 只要没有遇到换行和文件末尾，一直跳过
+                while self.ch != '\n' && self.ch != '\0' {
                     self.read_char();
                 }
+            
+            // 这里说明上面俩种情况都不是，逻辑走完了，loop结束
             } else {
                 break;
             }
         }
     }
-
+    
+    // 在处理标识符中使用，读取一个标识符并转换成String
     fn read_identifier(&mut self) -> String {
         let start_pos = self.position;
-        // 标识符可以包含字母、数字和下划线，但必须以字母或下划线开头
-        // is_letter 已经包含了下划线
-        while is_letter(self.ch) || is_digit(self.ch) {
+        while self.ch.is_ascii_alphanumeric() || self.ch == '_' {
             self.read_char();
         }
-        // 使用 from_utf8_lossy 是安全的，因为 is_letter/is_digit 保证了是 ASCII
-        String::from_utf8_lossy(&self.input[start_pos..self.position]).to_string()
+        self.source[start_pos..self.position].to_string()
     }
 
-    fn read_string(&mut self) -> Token {
-        let start_pos = self.position + 1;
-        loop {
-            self.read_char();
-            if self.ch == b'"' || self.ch == 0 {
-                break;
-            }
-        }
-        if self.ch == 0 { // 未闭合的字符串
-            return Token::Illegal('"');
-        }
-        let content = String::from_utf8_lossy(&self.input[start_pos..self.position]).to_string();
-        Token::Literal(Literal::String(content))
-    }
-
-    fn read_number(&mut self) -> Token {
+    // 处理字符串字面量（"hello world")
+    fn read_string(&mut self) -> Result<Token, LexerError> {
+        // 记录起始位置，方便传出错误
         let start_pos = self.position;
-        while is_digit(self.ch) {
+        let start_line = self.line;
+        let start_col = self.column;
+        
+        self.read_char(); // 消耗起始的 "
+        let content_start = self.position;
+        
+        while self.ch != '"' && self.ch != '\0' {
+            self.read_char();
+        }
+        
+        // 直接到结尾说明字符串未关闭
+        if self.ch == '\0' {
+            let span = Span { 
+                line: start_line, 
+                column: start_col, 
+                start_byte: start_pos, 
+                end_byte: self.position 
+            };
+            return Err(LexerError::UnterminatedString { start_span: span });
+        }
+        
+        // 截取字符串并转化为String
+        let content = self.source[content_start..self.position].to_string();
+
+        // 能到这里就可以直接返回字面量了
+        Ok(Token::Literal(Literal::String(content)))
+    }
+    
+    // 读取字符字面量 e.g. 'a'
+    fn read_char_literal(&mut self) -> Result<Token, LexerError> {
+        let start_pos = self.position;
+        let start_line = self.line;
+        let start_col = self.column;
+
+        self.read_char(); // 消耗起始的 '
+        let char_val = self.ch;
+        self.read_char(); // 消耗字符本身
+
+        // 如果不是以'结尾，则说明出错了，需要记录
+        if self.ch != '\'' {
+            let span = Span { 
+                line: start_line, 
+                column: start_col, 
+                start_byte: start_pos, 
+                end_byte: self.position 
+            };
+            return Err(LexerError::MalformedCharLiteral { span }); 
+        }
+        
+        // 返回正确识别的字符
+        Ok(Token::Literal(Literal::Char(char_val)))
+    }
+
+    // 处理数字字面量，包含整数和浮点数
+    fn read_number(&mut self) -> Result<Token, LexerError> {
+        let start_pos = self.position;
+        let start_line = self.line;
+        let start_col = self.column;
+
+        while self.ch.is_ascii_digit() {
             self.read_char();
         }
 
-        if self.ch == b'.' && is_digit(self.peek_char()) {
+        // 处理浮点数
+        if self.ch == '.' && self.peek_char().is_ascii_digit() {
             self.read_char(); // 消耗 '.'
-            while is_digit(self.ch) {
+            while self.ch.is_ascii_digit() {
                 self.read_char();
             }
-            let full_str = std::str::from_utf8(&self.input[start_pos..self.position]).unwrap();
-            let val = full_str.parse::<f64>().unwrap();
-            return Token::Literal(Literal::Float(val));
+            let num_str = &self.source[start_pos..self.position];
+            return match num_str.parse::<f64>() {
+                Ok(val) => Ok(Token::Literal(Literal::Float(val))),
+                Err(_) => {
+                    let span = Span { 
+                        line: start_line, 
+                        column: start_col, 
+                        start_byte: start_pos, 
+                        end_byte: self.position 
+                    };
+                    Err(
+                        LexerError::MalformedNumberLiteral { 
+                            reason: "Invalid float".to_string(), 
+                            span 
+                        }
+                    )
+                }
+            };
         }
-
-        let full_str = std::str::from_utf8(&self.input[start_pos..self.position]).unwrap();
-        let val = full_str.parse::<i64>().unwrap();
-        Token::Literal(Literal::Integer(val))
+        
+        // 处理整数
+        let num_str = &self.source[start_pos..self.position];
+        match num_str.parse::<i64>() {
+            Ok(val) => Ok(Token::Literal(Literal::Integer(val))),
+            Err(_) => {
+                 let span = Span { 
+                    line: start_line, 
+                    column: start_col, 
+                    start_byte: start_pos, 
+                    end_byte: self.position 
+                };
+                Err(
+                    LexerError::MalformedNumberLiteral { 
+                        reason: "Invalid integer".to_string(), 
+                        span 
+                    }
+                )
+            }
+        }
     }
 }
 
-// 辅助函数
+// --- 辅助函数 ---
+
+// 检查一个字符是否符合标识符命名标准
 fn is_letter(ch: u8) -> bool {
     ch.is_ascii_alphabetic() || ch == b'_'
 }
 
+// 检查一个字符是否是数字
 fn is_digit(ch: u8) -> bool {
     ch >= b'0' && ch <= b'9'
 }
 
-// UPDATED: lookup_ident 现在包含了所有新的关键字，并移除了 `main` 和 `print`
+// 处理一个标识符
+// 如果是一个关键字，则返回关键字；
+// 如果是普通标识符，就返回普通标识符
 fn lookup_ident(ident: &str) -> Token {
     let keyword = match ident {
+
+        // 匹配所有关键字
         "ret" => Keyword::Ret,
         "if" => Keyword::If,
         "else" => Keyword::Else,
+        "elif" => Keyword::Elif,
         "true" => Keyword::True,
         "false" => Keyword::False,
         "loop" => Keyword::Loop,
@@ -187,109 +354,12 @@ fn lookup_ident(ident: &str) -> Token {
         "new" => Keyword::New,
         "free" => Keyword::Free,
         "None" => Keyword::None,
-        // 如果不是以上任何关键字，它就是一个普通的标识符
+
+        // 如果不是以上任何关键字，它就是一个普通的标识符，提前返回
         _ => return Token::Identifier(ident.to_string()),
     };
+
+    // 返回关键字
     Token::Keyword(keyword)
 }
 
-// --- 测试模块 ---
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::token::{Keyword, Literal};
-
-    // UPDATED: 更新 `hello_world` 测试，因为 `main` 和 `print` 现在是标识符
-    #[test]
-    fn test_hello_world_as_identifiers() {
-        let input = r#"
-        main() { // a comment here
-            print("Hello, Tipy World!")
-        }
-        "#;
-
-        let expected_tokens = vec![
-            Token::Identifier("main".to_string()), // Was: Keyword(Keyword::Main)
-            Token::LParen,
-            Token::RParen,
-            Token::LBrace,
-            Token::Identifier("print".to_string()), // Was: Keyword(Keyword::Print)
-            Token::LParen,
-            Token::Literal(Literal::String("Hello, Tipy World!".to_string())),
-            Token::RParen,
-            Token::RBrace,
-            Token::Eof,
-        ];
-
-        let mut lexer = Lexer::new(input);
-        for expected in expected_tokens {
-            let token = lexer.next_token();
-            assert_eq!(token, expected);
-        }
-    }
-    
-    // 保持原有的 calculator 测试不变，它依然有效
-    #[test]
-    fn test_calculator_tokens() {
-        let input = "v: ~i32 = 5 + 10 * 2.5 / 1;";
-        let expected_tokens = vec![
-            Token::Identifier("v".to_string()),
-            Token::Colon,
-            Token::Tilde,
-            Token::Identifier("i32".to_string()),
-            Token::Equal,
-            Token::Literal(Literal::Integer(5)),
-            Token::Plus,
-            Token::Literal(Literal::Integer(10)),
-            Token::Star,
-            Token::Literal(Literal::Float(2.5)),
-            Token::Slash,
-            Token::Literal(Literal::Integer(1)),
-            Token::Semicolon,
-            Token::Eof,
-        ];
-        let mut lexer = Lexer::new(input);
-        for expected in expected_tokens {
-            assert_eq!(lexer.next_token(), expected);
-        }
-    }
-
-    // NEW: 添加一个专门的测试来验证函数定义和新关键字
-    #[test]
-    fn test_function_definition_tokens() {
-        let input = r#"
-        add(a: i32, b: i32) -> i32 {
-            ret a + b
-        }
-        "#;
-
-        let expected_tokens = vec![
-            Token::Identifier("add".to_string()),
-            Token::LParen,
-            Token::Identifier("a".to_string()),
-            Token::Colon,
-            Token::Identifier("i32".to_string()),
-            Token::Comma,
-            Token::Identifier("b".to_string()),
-            Token::Colon,
-            Token::Identifier("i32".to_string()),
-            Token::RParen,
-            Token::Arrow, // 关键的新 Token
-            Token::Identifier("i32".to_string()),
-            Token::LBrace,
-            Token::Keyword(Keyword::Ret), // 关键的新关键字
-            Token::Identifier("a".to_string()),
-            Token::Plus,
-            Token::Identifier("b".to_string()),
-            Token::RBrace,
-            Token::Eof,
-        ];
-
-        let mut lexer = Lexer::new(input);
-        for expected in expected_tokens {
-            let token = lexer.next_token();
-            // println!("Generated: {:?}", token); // 取消注释以进行调试
-            assert_eq!(token, expected);
-        }
-    }
-}

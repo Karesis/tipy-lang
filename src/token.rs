@@ -51,6 +51,10 @@ pub enum Literal {
     Integer(i64),
     /// 浮点数类型字面量, e.g., 3.14, 0.5
     Float(f64),
+    /// 字符串字面量, e.g., 'a'
+    Char(char),
+    /// 布尔值字面量, e.g., true
+    Boolean(bool),
 }
 
 /// 代表 Tipy 源代码经过词法分析后产生的单个 Token。
@@ -59,8 +63,6 @@ pub enum Literal {
 pub enum Token {
     /// 文件结束符 (End of File)，表示源代码已读取完毕。
     Eof,
-    /// 非法字符，表示词法分析器遇到了无法识别的字符。
-    Illegal(char),
 
     // --- 标识与值 ---
     /// 标识符，如变量名、函数名 `my_var`, `add`。
@@ -86,7 +88,7 @@ pub enum Token {
 
     // --- 运算符与特殊符号 ---
     /// 赋值符号 `=`.
-    Equal,
+    Assign,
     /// 加号 `+`.
     Plus,
     /// 减号 `-`.
@@ -99,8 +101,25 @@ pub enum Token {
     Colon,
     /// 可变性标记 `~`.
     Tilde,
+
+    // --- 比较运算符 ---
+    /// 大于号 `>`.
+    GreaterThan,
+    /// 大于等于 `>=`
+    GreaterEqual,
+    /// 小于号 `<`.
+    LessThan,
+    /// 小于等于 `<=`
+    LessEqual,
+    /// 相等比较 `==`.
+    Equal,
+    /// 不等比较 `!=`.
+    NotEqual,
+    /// 逻辑非 `!`.
+    Bang, // Bang (!) 是构成 != 的一部分，也可能用于未来的逻辑非操作
+
     
-    // --- v0.0.3 新增，用于函数定义 ---
+    // --- 用于函数定义 ---
     /// 函数返回类型箭头 `->`.
     Arrow,
 

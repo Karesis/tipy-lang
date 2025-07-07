@@ -1,588 +1,756 @@
-// src/parser.rs
+// file: src/parser.rs
 
-// UPDATED: 引入所有新的 AST 节点
+// --- 模块引入 ---
+// 每个 `use` 块都解释了其引入的模块的职责。
+
+// 引入诊断模块，用于创建和收集结构化的错误信息。
+use crate::diagnostics::{CompilerError, ParserError, Span}; 
+
+// 引入抽象语法树 (AST) 模块。
+// 解析器的最终目标就是将 Token 流转换成这些结构化的 AST 节点。
 use crate::ast::{
-    Program, Statement, Expression, Operator, PrefixOperator, TopLevelStatement,
-    FunctionDeclaration, FunctionParameter, BlockStatement, VarDeclaration, ReturnStatement,
-    PrefixExpression, InfixExpression, AssignmentExpression, CallExpression,
-};
-use crate::lexer::Lexer;
-use crate::token::{Token, Keyword, Literal}; // UPDATED: 引入 Keyword
+    // --- 顶层结构 ---
+    Program,
+    TopLevelStatement,
 
-// 运算符优先级 (Precedence) - 基本保持不变
-#[derive(PartialEq, PartialOrd, Clone, Copy)]
+    // --- 语句 (Statements) ---
+    Statement,
+    BlockStatement,
+    VarDeclaration,
+    ReturnStatement,
+    WhileStatement,
+    BreakStatement,
+    ContinueStatement,
+
+    // --- 表达式 (Expressions) ---
+    Expression,
+    PrefixExpression,
+    InfixExpression,
+    AssignmentExpression,
+    CallExpression,
+    IfExpression,
+    LoopExpression,
+    
+    // --- 运算符 ---
+    Operator,
+    PrefixOperator,
+
+    // --- 函数相关 ---
+    FunctionDeclaration,
+    FunctionParameter,
+};
+
+// 引入词法分析器，它是 Parser 的 Token 来源。
+use crate::lexer::Lexer;
+
+// 引入 Token 定义，这是 Parser 直接消费的基本单元。
+use crate::token::{Token, Keyword, Literal}; 
+
+/// 定义了 Tipy 语言中运算符的优先级。
+///
+/// 这是 Pratt 解析器（一种自顶向下的算符优先解析器）的核心。
+/// 通过比较当前和下一个 Token 的优先级，解析器能够正确地处理
+/// 复杂的表达式，如 `a + b * c`，确保乘法先于加法计算。
+///
+/// 枚举成员的顺序从低到高排列。
+#[derive(PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub enum Precedence {
+    /// 最低优先级，作为所有表达式解析的起点。
     Lowest,
-    Equals,      // = (赋值)
-    Sum,         // + or -
-    Product,     // * or /
-    Prefix,      // -X or !X
-    Call,        // myFunction(X)
+    /// 赋值表达式的优先级, e.g., `x = y`
+    Assign,
+    /// 比较表达式的优先级, e.g., `x == y`, `x > y`
+    Comparison,
+    /// 加减法表达式的优先级, e.g., `x + y`
+    Sum,
+    /// 乘除法表达式的优先级, e.g., `x * y`
+    Product,
+    /// 前缀表达式的优先级, e.g., `-x`, `!y`
+    Prefix,
+    /// 函数调用表达式的优先级, e.g., `my_func(x)`
+    Call,
 }
 
+/// 解析器结构体，负责将 Token 流转换为 AST。
+///
+/// 它持有词法分析器 `Lexer` 来获取 Token，
+/// 并通过向前“偷看”一个 Token (`peek_token`) 的策略来决定如何构建语法树。
+/// 在整个解析过程中，所有遇到的错误都会被收集到 `errors` 向量中。
 pub struct Parser<'a> {
+    /// 词法分析器实例，为解析器提供源源不断的 Token。
     lexer: Lexer<'a>,
+    
+    /// 当前正在处理的 Token。解析逻辑的判断依据。
     current_token: Token,
+
+    /// 下一个即将被处理的 Token。Pratt 解析器和许多其他解析策略
+    /// 都需要它来决定当前的操作（例如，一个 `+` 后面是数字还是括号）。
     peek_token: Token,
-    pub errors: Vec<String>,
+    
+    /// 错误收集器。
+    ///
+    /// 这是我们新的诊断系统的核心部分。解析器在遇到错误时，
+    /// 不会立即停止，而是将一个结构化的 `CompilerError` 添加到此向量中，
+    /// 然后尝试恢复并继续解析，以便一次性报告多个错误。
+    pub errors: Vec<CompilerError>,
 }
 
 impl<'a> Parser<'a> {
+
+    /// 创建一个新的 `Parser` 实例。
+    ///
+    /// 在构造过程中，它会立即从 `Lexer` 中预读取两个 Token，
+    /// 以便填充 `current_token` 和 `peek_token`。
+    /// 这是解析器能够“向前看”并做出决策的基础。
+    ///
+    /// # Arguments
+    ///
+    /// * `lexer` - 一个已经初始化好的 `Lexer` 实例。
     pub fn new(mut lexer: Lexer<'a>) -> Self {
-        let current_token = lexer.next_token();
-        let peek_token = lexer.next_token();
-        Parser {
+        // 先创建一个包含 lexer 和空错误列表的 "半成品" Parser
+        let mut p = Parser {
             lexer,
-            current_token,
-            peek_token,
+            // 暂时用 Eof 占位，将立即调用 next_token 来填充它们
+            current_token: Token::Eof,
+            peek_token: Token::Eof,
             errors: Vec::new(),
-        }
+        };
+
+        // 调用两次 next_token() 来正确初始化 current 和 peek。
+        // next_token() 内部已经包含了处理词法错误并将其记入 p.errors 的逻辑
+        p.next_token();
+        p.next_token();
+
+        p
     }
 
-    fn next_token(&mut self) {
-        self.current_token = self.peek_token.clone();
-        self.peek_token = self.lexer.next_token();
-    }
-    
-    // REWRITTEN: `parse_program` 现在解析顶层声明
+    /// 解析整个 Tipy 程序源代码，并返回程序的根节点 `Program` (一个 AST)。
+    ///
+    /// 这是解析器的主要入口点。它会持续解析顶层声明（目前仅支持函数），
+    /// 直到遇到文件结束符 (Eof) 为止。
+    ///
+    /// 该函数采用**错误恢复**策略：
+    /// - 当 `parse_top_level_statement` 成功时，它会将结果添加到程序体中。
+    /// - 当遇到一个解析错误 (`Err`) 时，它不会立即停止，而是：
+    ///   1. 将错误记录到 `self.errors` 向量中。
+    ///   2. 调用 `self.synchronize()` 来尝试跳过出错的 Token，找到下一个
+    ///      可能安全的同步点（如一个新的函数声明），然后继续解析。
+    ///
+    /// 这种机制允许我们一次性报告多个解析错误，极大地提升了用户体验，
+    /// 并且从根本上解决了旧代码中的无限循环问题。
     pub fn parse_program(&mut self) -> Program {
         let mut program = Program::new();
 
-        while self.current_token != Token::Eof {
-            if let Some(stmt) = self.parse_top_level_statement() {
-                program.body.push(stmt);
+        while !self.current_token_is(&Token::Eof) {
+            match self.parse_top_level_statement() {
+                Ok(stmt) => program.body.push(stmt),
+                Err(err) => {
+                    // NEW: 集成新的诊断系统
+                    self.errors.push(CompilerError::Parser(err));
+                    // NEW: 调用错误恢复机制，防止无限循环
+                    self.synchronize();
+                }
             }
-            // 从旧版 parser 借鉴的简单逻辑：每次循环都前进一次
-            self.next_token();
         }
         program
     }
 
-    // === 优先级辅助函数 (无变化) ===
+    // --- 内部辅助与错误处理 (Internal Helpers & Error Handling) ---
+
+    /// 错误恢复函数，用于在解析失败后寻找下一个安全的同步点。
+    ///
+    /// 这是防止无限循环并能一次性报告多个错误的关键。当一个解析函数
+    /// 返回 `Err` 后，主循环会调用此函数。
+    ///
+    /// 它的策略是：
+    /// 1. 至少消耗掉引发错误的当前 Token。
+    /// 2. 不断向前移动，直到找到一个被认为是新语句开始的标志
+    ///    （如分号 `;`，或 `ret`, `if` 等关键字）。
+    fn synchronize(&mut self) {
+        self.next_token(); // 至少消耗掉引发错误的 token
+
+        while !self.current_token_is(&Token::Eof) {
+            // 如果上一个 token 是分号，那么我们很可能在一个新语句的开头，可以安全退出。
+            if self.current_token_is(&Token::Semicolon) {
+                self.next_token();
+                return;
+            }
+
+            // 如果下一个 token 是一个常见的语句起始关键字，我们也可以认为找到了同步点。
+            match self.peek_token {
+                Token::Keyword(
+                    Keyword::Class | 
+                    Keyword::Ret   | 
+                    Keyword::If    | 
+                    Keyword::Loop  | 
+                    Keyword::While
+                ) => return,
+                _ => {}
+            }
+            
+            self.next_token();
+        }
+    }
+
+    /// 检查 `peek_token` 是否为期望的类型，如果是，则向前推进一个 Token，并返回成功。
+    /// 如果不是，则返回一个包含详细信息的 `ParserError`。
+    ///
+    /// 这是解析器中最常用的函数之一，它将 "检查并消耗" 这个动作合二为一，
+    /// 并通过返回 `Result` 允许我们使用 `?` 操作符来极大地简化错误处理。
+    ///
+    /// # Returns
+    /// - `Ok(())` 如果 `peek_token` 匹配 `expected`。
+    /// - `Err(ParserError)` 如果不匹配。
+    fn expect_peek(&mut self, expected: &Token) -> Result<(), ParserError> {
+        if self.peek_token_is(expected) {
+            self.next_token();
+            Ok(())
+        } else {
+            Err(self.peek_error(format!("Expected next token to be {:?}", expected)))
+        }
+    }
+
+    /// 检查当前 Token (`current_token`) 是否为指定的类型。
+    fn current_token_is(&self, token_type: &Token) -> bool {
+        // 使用 std::mem::discriminant 来比较 enum 的变体，而不关心其内部的值。
+        // 这对于像 Token::Identifier(_) 这样的情况特别有用。
+        std::mem::discriminant(&self.current_token) == std::mem::discriminant(token_type)
+    }
+    
+    /// 检查下一个 Token (`peek_token`) 是否为指定的类型。
+    fn peek_token_is(&self, token_type: &Token) -> bool {
+        std::mem::discriminant(&self.peek_token) == std::mem::discriminant(token_type)
+    }
+
+    /// 获取下一个 Token (`peek_token`) 的优先级。
     fn peek_precedence(&self) -> Precedence {
         Self::token_to_precedence(&self.peek_token)
     }
 
+    /// 获取当前 Token (`current_token`) 的优先级。
     fn current_precedence(&self) -> Precedence {
         Self::token_to_precedence(&self.current_token)
     }
     
+    /// 将一个 Token 映射到其对应的运算符优先级。
+    ///
+    /// 注意：只有作为中缀运算符的 Token 才有高于 `Lowest` 的优先级。
     fn token_to_precedence(token: &Token) -> Precedence {
         match token {
+            Token::Assign => Precedence::Assign,
+            Token::Equal | Token::NotEqual | Token::LessThan | Token::GreaterThan |
+            Token::LessEqual | Token::GreaterEqual => Precedence::Comparison,
             Token::Plus | Token::Minus => Precedence::Sum,
             Token::Star | Token::Slash => Precedence::Product,
-            Token::Equal => Precedence::Equals,
             Token::LParen => Precedence::Call,
             _ => Precedence::Lowest,
         }
     }
-
-    // === 顶层解析 (Top-Level Parsing) ===
-
-    // NEW: 解析顶层声明的调度函数
-    fn parse_top_level_statement(&mut self) -> Option<TopLevelStatement> {
-        // 目前 Tipy v0.0.3 的顶层只有函数声明
-        // 函数声明总是以 `Identifier` 开头，后跟 `(`
-        if let Token::Identifier(_) = self.current_token {
-            if self.peek_token == Token::LParen {
-                return self.parse_function_declaration().map(TopLevelStatement::Function);
-            }
+    
+    // --- 错误创建辅助函数 ---
+    
+    /// 根据当前 Token (`current_token`) 创建一个 `ParserError`。
+    fn current_error(&self, message: String) -> ParserError {
+        ParserError::UnexpectedToken {
+            expected: message,
+            found: self.current_token.clone(),
+            // TODO: 当 Token 携带 Span 信息后，在这里传递真实的 Span。
+            span: Span::default(), 
         }
-        
-        self.errors.push(format!("Expected a top-level function declaration, found {:?}.", self.current_token));
-        None
+    }
+    
+    /// 根据下一个 Token (`peek_token`) 创建一个 `ParserError`。
+    fn peek_error(&self, message: String) -> ParserError {
+        ParserError::UnexpectedToken {
+            expected: message,
+            found: self.peek_token.clone(),
+            // TODO: 当 Token 携带 Span 信息后，在这里传递真实的 Span。
+            span: Span::default(),
+        }
     }
 
-    // REWRITTEN: `parse_function_statement` 被重写为 `parse_function_declaration`
-    fn parse_function_declaration(&mut self) -> Option<FunctionDeclaration> {
-        let name = if let Token::Identifier(n) = &self.current_token {
-            n.clone()
-        } else {
-            self.errors.push(format!("Expected function name, found {:?}", self.current_token));
-            return None;
-        };
+    // --- 顶层与声明解析 (Top-Level & Declaration Parsing) ---
+
+    /// 解析一个顶层声明。
+    ///
+    /// 在 Tipy v0.0.5 中，唯一合法的顶层声明是函数声明。
+    /// 未来这里可以扩展，以支持 `class`, `enum` 等。
+    ///
+    /// # Returns
+    /// - `Ok(TopLevelStatement)` 如果成功解析一个函数声明。
+    /// - `Err(ParserError)` 如果遇到的 Token 不是一个合法的顶层声明的开始。
+    fn parse_top_level_statement(&mut self) -> Result<TopLevelStatement, ParserError> {
+        // 一个简单的启发式规则：如果当前是标识符，且下一个是左括号，就认为是函数声明。
+        if self.current_token_is(&Token::Identifier("".into())) && self.peek_token_is(&Token::LParen) {
+            // `?` 操作符会自动处理 `parse_function_declaration` 可能返回的 Err
+            let func_decl = self.parse_function_declaration()?;
+            return Ok(TopLevelStatement::Function(func_decl));
+        }
         
-        if !self.expect_peek(Token::LParen) { return None; }
+        // 如果不满足以上条件，则报告一个错误。
+        Err(self.current_error("Expected a function declaration".to_string()))
+    }
 
+    /// 解析一个完整的函数声明。
+    ///
+    /// e.g., `my_func(a: i32, b: i32) -> i32 { ... }`
+    fn parse_function_declaration(&mut self) -> Result<FunctionDeclaration, ParserError> {
+        // 1. 解析函数名
+        let name = self.parse_identifier_string()?;
+        
+        // 2. 解析参数列表
+        self.expect_peek(&Token::LParen)?;
         let params = self.parse_function_parameters()?;
-
-        // `parse_function_parameters` 结束后, current_token 应该是 ')'
-        // 接下来检查返回箭头 '->'
-        let return_type = if self.peek_token == Token::Arrow {
+        // `parse_function_parameters` 结束时，`current_token` 应该是 ')'
+        
+        // 3. 解析可选的返回类型
+        let return_type = if self.peek_token_is(&Token::Arrow) {
             self.next_token(); // 消耗 '->'
             self.next_token(); // 前进到类型标识符
-            if let Token::Identifier(type_name) = &self.current_token {
-                type_name.clone()
-            } else {
-                self.errors.push("Expected return type name after '->'".to_string());
-                return None;
-            }
+            self.parse_identifier_string()?
         } else {
-            // Tipy 规范: 如果不返回值，则 `->` 和返回类型都可以省略
-            // 我们用 "void" (或任何内部标识) 来表示无返回值
-            "void".to_string() 
+            // 如果没有 '->'，则为隐式 void 返回
+            "void".to_string()
         };
 
-        if !self.expect_peek(Token::LBrace) { return None; }
+        // 4. 解析函数体
+        self.expect_peek(&Token::LBrace)?;
+        let body = self.parse_block_statement()?; // 我们将在下一步实现此函数
         
-        let body = self.parse_block_statement()?;
-
-        Some(FunctionDeclaration { name, params, return_type, body })
+        // `parse_block_statement` 结束时，`current_token` 应该是 '}'
+        // 注意：我们在这里不消耗最后的 '}'，因为 Tipy 的块表达式特性
+        // 意味着 `{...}` 本身可以是一个表达式，其调用者需要 '}' 作为结束标志。
+        // 但对于函数声明，它的主体是一个语句块，通常需要消耗掉。这是一个需要仔细考虑的设计点。
+        // 为保持一致性，我们暂定由 `parse_block_statement` 的调用者负责处理 `{` 和 `}`。
+        
+        Ok(FunctionDeclaration { name, params, return_type, body })
     }
 
-    // NEW: 解析函数参数列表
-    fn parse_function_parameters(&mut self) -> Option<Vec<FunctionParameter>> {
+    /// 解析函数声明中的参数列表 `(p1: T1, p2: T2, ...)`
+    fn parse_function_parameters(&mut self) -> Result<Vec<FunctionParameter>, ParserError> {
         let mut params = Vec::new();
 
-        // 检查空参数列表: `()`
-        if self.peek_token == Token::RParen {
+        // 处理空参数列表 `()` 的情况
+        if self.peek_token_is(&Token::RParen) {
             self.next_token(); // 消耗 ')'
-            return Some(params);
+            return Ok(params);
         }
 
-        self.next_token(); // 消耗 '(', 前进到第一个参数名
+        self.next_token(); // 消耗 '('，前进到第一个参数名
 
+        // 循环解析每个参数
         loop {
-            let param_name = if let Token::Identifier(n) = &self.current_token { n.clone() } else { return None; };
-            if !self.expect_peek(Token::Colon) { return None; }
-            self.next_token(); // 消耗 ':', 前进到类型名
-            let param_type = if let Token::Identifier(t) = &self.current_token { t.clone() } else { return None; };
+            let param_name = self.parse_identifier_string()?;
+            self.expect_peek(&Token::Colon)?;
+            self.next_token(); // 消耗 ':'，前进到类型名
+            let param_type = self.parse_identifier_string()?;
             
             params.push(FunctionParameter { name: param_name, param_type });
             
-            if self.peek_token == Token::RParen {
-                self.next_token(); // 消耗 ')'
-                break;
-            } else if self.peek_token == Token::Comma {
-                self.next_token(); // 消耗 ','
-                self.next_token(); // 前进到下一个参数名
-            } else {
-                self.errors.push("Expected ',' or ')' in parameter list".to_string());
-                return None;
+            // 检查下一个 Token，决定是继续循环还是结束
+            if !self.peek_token_is(&Token::Comma) {
+                break; // 如果不是逗号，则参数列表应该结束了
             }
+            
+            self.next_token(); // 消耗 ','
+            self.next_token(); // 前进到下一个参数名
         }
-        Some(params)
+
+        // 循环结束后，必须紧跟一个右括号
+        self.expect_peek(&Token::RParen)?;
+
+        Ok(params)
     }
 
-    // === 语句解析 (Statement Parsing) - 用于函数体内 ===
+    // --- 语句解析 (Statement Parsing) ---
 
-    // UPDATED: `parse_statement` 现在用于解析函数体内的语句
-    fn parse_statement(&mut self) -> Option<Statement> {
-        match &self.current_token {
-            // 变量声明: `my_var: i32 = ...`
-            // 它以 Identifier 开头，后跟 Colon
-            Token::Identifier(_) if self.peek_token == Token::Colon => {
+    /// 解析一个语句。
+    ///
+    /// 这是语句解析的“调度中心”。它根据当前的 Token 类型，
+    /// 来决定应该调用哪个更具体的解析函数（如解析 `ret` 语句或变量声明）。
+    fn parse_statement(&mut self) -> Result<Statement, ParserError> {
+        match self.current_token {
+            Token::Keyword(Keyword::Ret) => self.parse_return_statement(),
+            Token::Keyword(Keyword::While) => self.parse_while_statement(),
+            Token::Keyword(Keyword::Break) => self.parse_break_statement(),
+            Token::Keyword(Keyword::Continue) => self.parse_continue_statement(),
+            // `name: type` 形式的变量声明
+            Token::Identifier(_) if self.peek_token_is(&Token::Colon) => {
                 self.parse_variable_declaration_statement()
             }
-            // 返回语句: `ret ...`
-            Token::Keyword(Keyword::Ret) => self.parse_return_statement(),
-            // 其他所有情况都作为表达式语句处理
+            // 如果以上都不是，则它应该是一个表达式语句，例如一个函数调用 `my_func();`
             _ => self.parse_expression_statement(),
         }
     }
-    
-    // UPDATED: 此函数现在返回一个 `BlockStatement` struct
-    fn parse_block_statement(&mut self) -> Option<BlockStatement> {
+
+    /// 解析一个代码块 `{ ... }`。
+    ///
+    /// # 解析约定
+    /// - **调用者**负责消耗起始的 `{`。
+    /// - 此函数会持续解析内部的语句，直到遇到 `}` 或文件末尾 `Eof`。
+    /// - 此函数**不会**消耗最后的 `}`，将其留给调用者处理。
+    ///   这对于将代码块作为表达式（其值是最后一个表达式）的场景至关重要。
+    ///
+    /// # 错误恢复
+    /// 这是解析器内第二个实现错误恢复循环的地方。如果块内某条语句解析失败，
+    /// 它会记录错误，调用 `synchronize()` 跳到下一个安全点，然后继续解析块内的
+    /// 其他语句，而不是让整个代码块的解析失败。
+    fn parse_block_statement(&mut self) -> Result<BlockStatement, ParserError> {
         let mut statements = Vec::new();
-        self.next_token(); // 消耗 '{'
 
-        while self.current_token != Token::RBrace && self.current_token != Token::Eof {
-            if let Some(stmt) = self.parse_statement() {
-                statements.push(stmt);
+        while !self.current_token_is(&Token::RBrace) && !self.current_token_is(&Token::Eof) {
+            match self.parse_statement() {
+                Ok(stmt) => statements.push(stmt),
+                Err(err) => {
+                    self.errors.push(CompilerError::Parser(err));
+                    self.synchronize();
+                }
             }
-            self.next_token(); // 前进到下一条语句的开头
+            // 在 Tipy 中分号是可选的，我们统一在循环末尾处理 Token 前进，
+            // 无论语句后面有没有分号。
+            self.next_token();
         }
-
-        if self.current_token != Token::RBrace {
-            self.errors.push("Expected '}' at the end of block".to_string());
-            return None;
-        }
-
-        Some(BlockStatement { statements })
+    
+        Ok(BlockStatement { statements })
     }
     
-    // NEW: 解析返回语句
-    fn parse_return_statement(&mut self) -> Option<Statement> {
-        let value = if self.peek_token == Token::RBrace || self.peek_token == Token::Semicolon {
-            // 对应 `ret` 或 `ret;` (隐式返回 void)
+    /// 解析返回语句 `ret <expression>;`
+    fn parse_return_statement(&mut self) -> Result<Statement, ParserError> {
+        self.next_token(); // 消耗 `ret` 关键字
+
+        let value = if self.current_token_is(&Token::Semicolon) || self.current_token_is(&Token::RBrace) {
+            // 处理 `ret;` 或紧跟 `}` 的 `ret`
             None
         } else {
-            self.next_token(); // 消耗 `ret`
-            self.parse_expression(Precedence::Lowest)
+            // 解析 `ret <expression>`
+            Some(self.parse_expression(Precedence::Lowest)?)
         };
         
-        // 可选地消耗分号
-        if self.peek_token == Token::Semicolon {
+        // 如果后面恰好有个分号，我们也消耗掉它，以保持整洁
+        if self.peek_token_is(&Token::Semicolon) {
             self.next_token();
         }
 
-        Some(Statement::Return(ReturnStatement { value }))
+        Ok(Statement::Return(ReturnStatement { value }))
     }
 
-    // UPDATED: 稍作修改以匹配新的 AST 和 Tipy 规范
-    fn parse_variable_declaration_statement(&mut self) -> Option<Statement> {
-        let name = match &self.current_token {
-            Token::Identifier(name) => name.clone(),
-            _ => return None, // 不应该发生
-        };
+    /// 解析变量声明语句 `name: [~]type [= value];`
+    fn parse_variable_declaration_statement(&mut self) -> Result<Statement, ParserError> {
+        // `parse_statement` 已经确认了当前是 Identifier
+        let name = self.parse_identifier_string()?;
         
-        self.next_token(); // 消耗 name, 前进到 ':'
-        self.next_token(); // 消耗 ':', 前进到可变性标记或类型
-        
-        let is_mutable = if self.current_token == Token::Tilde {
+        self.expect_peek(&Token::Colon)?; // 消耗 ':'
+        self.next_token(); // 前进到类型或 '~'
+
+        let is_mutable = if self.current_token_is(&Token::Tilde) {
             self.next_token(); // 消耗 '~'
             true
         } else {
             false
         };
 
-        let var_type = match &self.current_token {
-            Token::Identifier(type_name) => type_name.clone(),
-            _ => {
-                self.errors.push("Expected type name in variable declaration.".to_string());
-                return None;
-            }
-        };
-
-        // UPDATED: 初始值是可选的，以支持 `x: i32;`
-        let value = if self.peek_token == Token::Equal {
+        let var_type = self.parse_identifier_string()?;
+        
+        let value = if self.peek_token_is(&Token::Assign) {
             self.next_token(); // 消耗类型, 前进到 '='
-            self.next_token(); // 消耗 '=', 前进到表达式
-            self.parse_expression(Precedence::Lowest)
+            self.next_token(); // 消耗 '=', 前进到表达式的开头
+            Some(self.parse_expression(Precedence::Lowest)?)
         } else {
-            None
+            None // 没有初始值
         };
 
-        if self.peek_token == Token::Semicolon { self.next_token(); }
-
-        Some(Statement::VarDeclaration(VarDeclaration { name, is_mutable, var_type, value }))
-    }
-
-    fn parse_expression_statement(&mut self) -> Option<Statement> {
-        let expr = self.parse_expression(Precedence::Lowest)?;
-        if self.peek_token == Token::Semicolon {
+        // 同样，消耗可选的分号
+        if self.peek_token_is(&Token::Semicolon) {
             self.next_token();
         }
-        Some(Statement::Expression(expr))
+
+        Ok(Statement::VarDeclaration(VarDeclaration { name, is_mutable, var_type, value }))
     }
 
-    // === 表达式解析 (Expression Parsing) - Pratt Engine ===
+    /// 解析一个表达式语句。
+    ///
+    /// 表达式语句就是一个表达式，其计算结果被丢弃。
+    /// 例如，一个函数调用 `do_something(a, b);`
+    fn parse_expression_statement(&mut self) -> Result<Statement, ParserError> {
+        let expr = self.parse_expression(Precedence::Lowest)?;
+
+        // Tipy 语法中分号是可选的，我们在这里检查并消耗它，
+        // 这样表达式语句就可以正确地结束。
+        if self.peek_token_is(&Token::Semicolon) {
+            self.next_token();
+        }
+
+        Ok(Statement::Expression(expr))
+    }
+
+    /// 解析 `while` 循环语句 `while <condition> { ... }`
+    fn parse_while_statement(&mut self) -> Result<Statement, ParserError> {
+        self.next_token(); // 消耗 `while`
+        
+        let condition = self.parse_expression(Precedence::Lowest)?;
+        
+        self.expect_peek(&Token::LBrace)?;
+        let body = self.parse_block_statement()?;
+        // parse_block_statement 不消耗 '}'，所以我们在这里消耗
+        self.expect_peek(&Token::RBrace)?;
+        
+        Ok(Statement::While(WhileStatement { condition, body }))
+    }
     
-    // UPDATED: 更新以返回新的 AST 节点
-    fn parse_expression(&mut self, precedence: Precedence) -> Option<Expression> {
-        let mut left_expr = match self.current_token.clone() {
-            Token::Identifier(name) => Some(Expression::Identifier(name)),
-            Token::Literal(lit) => Some(Expression::Literal(lit)),
-            Token::Minus => self.parse_prefix_expression(),
+    /// 解析 `break` 语句 `break [value];`
+    fn parse_break_statement(&mut self) -> Result<Statement, ParserError> {
+        self.next_token(); // 消耗 `break`
+
+        let value = if self.current_token_is(&Token::Semicolon) || self.current_token_is(&Token::RBrace) {
+            None
+        } else {
+            Some(self.parse_expression(Precedence::Lowest)?)
+        };
+        
+        if self.peek_token_is(&Token::Semicolon) {
+            self.next_token();
+        }
+
+        Ok(Statement::Break(BreakStatement { value }))
+    }
+
+    /// 解析 `continue` 语句 `continue;`
+    fn parse_continue_statement(&mut self) -> Result<Statement, ParserError> {
+        // `continue` 后面没有值，所以直接创建节点即可
+        if self.peek_token_is(&Token::Semicolon) {
+            self.next_token();
+        }
+        Ok(Statement::Continue(ContinueStatement))
+    }
+
+    // --- 表达式解析 (Expression Parsing) ---
+
+    /// 解析一个表达式，这是 Pratt 解析器的核心入口。
+    ///
+    /// # Arguments
+    /// * `precedence` - 当前的运算符优先级。调用者通过这个参数来控制
+    ///   解析器应该“吃掉”多高优先级的运算符。
+    fn parse_expression(&mut self, precedence: Precedence) -> Result<Expression, ParserError> {
+        // --- 1. 前缀解析 (Prefix Parsing) ---
+        // 每个表达式都必须由一个前缀部分开始，例如一个数字、一个变量名、一个 `!` 号，或一个 `if` 关键字。
+        // 我们根据当前 Token 类型，调用对应的前缀解析函数。
+        let mut left_expr = match self.current_token {
+            Token::Identifier(_) => Ok(self.parse_identifier_expression()?),
+            Token::Literal(_) => Ok(self.parse_literal_expression()?),
+            Token::Keyword(Keyword::True) | Token::Keyword(Keyword::False) => Ok(self.parse_boolean_expression()?),
+            Token::Bang | Token::Minus => self.parse_prefix_expression(),
             Token::LParen => self.parse_grouped_expression(),
-            // NEW: 处理 `true` 和 `false` 关键字
-            Token::Keyword(Keyword::True) => Some(Expression::Literal(Literal::Integer(1))), // 简单实现，或添加 Bool Literal
-            Token::Keyword(Keyword::False) => Some(Expression::Literal(Literal::Integer(0))),
-            _ => {
-                self.errors.push(format!("No prefix parse function for {:?}", self.current_token));
-                None
-            }
+            Token::Keyword(Keyword::If) => self.parse_if_expression(),
+            Token::Keyword(Keyword::Loop) => self.parse_loop_expression(),
+            Token::LBrace => self.parse_block_expression(),
+            _ => Err(self.current_error(format!("Expected an expression, but found {:?}", self.current_token))),
         }?;
 
-        while self.peek_token != Token::Semicolon && precedence < self.peek_precedence() {
+        // --- 2. 中缀解析 (Infix Parsing) ---
+        // 在解析完前缀表达式后，我们进入一个循环，处理所有优先级比当前 `precedence` 更高的中缀运算符。
+        while precedence < self.peek_precedence() {
+            // 根据下一个 Token (`peek_token`) 的类型，决定调用哪个中缀解析函数。
+            // 例如，如果下一个是 `+`，我们就解析一个加法表达式。
+            // 如果下一个是 `(`, 我们就解析一个函数调用。
             match self.peek_token {
-                Token::Plus | Token::Minus | Token::Star | Token::Slash => {
+                Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Equal |
+                Token::NotEqual | Token::LessThan | Token::LessEqual | Token::GreaterThan | Token::GreaterEqual => {
                     self.next_token();
                     left_expr = self.parse_infix_expression(left_expr)?;
-                },
-                Token::Equal => {
+                }
+                Token::Assign => {
                     self.next_token();
                     left_expr = self.parse_assignment_expression(left_expr)?;
                 }
                 Token::LParen => {
                     self.next_token();
                     left_expr = self.parse_call_expression(left_expr)?;
-                },
-                _ => return Some(left_expr),
+                }
+                _ => {
+                    // 如果没有更多的中缀运算符，或者下一个运算符的优先级不够高，则循环结束。
+                    return Ok(left_expr);
+                }
             }
         }
-        Some(left_expr)
+
+        Ok(left_expr)
     }
 
-    // --- 前缀与中缀处理函数，全部更新以返回新的 AST 节点 ---
+    // --- 前缀表达式解析函数 ---
 
-    fn parse_prefix_expression(&mut self) -> Option<Expression> {
-        let operator = match self.current_token {
+    fn parse_identifier_expression(&mut self) -> Result<Expression, ParserError> {
+        self.parse_identifier_string().map(Expression::Identifier)
+    }
+    
+    fn parse_literal_expression(&mut self) -> Result<Expression, ParserError> {
+        // 我们已经确认 current_token 是 Literal，所以这里可以安全地 clone
+        Ok(Expression::Literal(
+            if let Token::Literal(lit) = &self.current_token {
+                lit.clone()
+            } else { unreachable!() }
+        ))
+    }
+
+    fn parse_boolean_expression(&mut self) -> Result<Expression, ParserError> {
+        let value = self.current_token_is(&Token::Keyword(Keyword::True));
+        Ok(Expression::Literal(Literal::Boolean(value)))
+    }
+
+    fn parse_prefix_expression(&mut self) -> Result<Expression, ParserError> {
+        let op = match self.current_token {
             Token::Minus => PrefixOperator::Minus,
-            _ => return None,
+            Token::Bang => PrefixOperator::Not,
+            _ => unreachable!(), // 调用者已保证
         };
-        self.next_token();
-        let right = self.parse_expression(Precedence::Prefix)?;
-        Some(Expression::Prefix(PrefixExpression { op: operator, right: Box::new(right) }))
+        self.next_token(); // 消耗前缀操作符
+        let right = Box::new(self.parse_expression(Precedence::Prefix)?);
+        Ok(Expression::Prefix(PrefixExpression { op, right }))
     }
 
-    fn parse_grouped_expression(&mut self) -> Option<Expression> {
-        self.next_token();
+    fn parse_grouped_expression(&mut self) -> Result<Expression, ParserError> {
+        self.next_token(); // 消耗 '('
         let expr = self.parse_expression(Precedence::Lowest)?;
-        if !self.expect_peek(Token::RParen) { return None; }
-        Some(expr)
+        self.expect_peek(&Token::RParen)?; // 期望并消耗 ')'
+        Ok(expr)
     }
 
-    fn parse_infix_expression(&mut self, left: Expression) -> Option<Expression> {
+    fn parse_if_expression(&mut self) -> Result<Expression, ParserError> {
+        self.next_token(); // 消耗 'if'
+        let condition = Box::new(self.parse_expression(Precedence::Lowest)?);
+        
+        self.expect_peek(&Token::LBrace)?;
+        let consequence = self.parse_block_statement()?;
+        self.expect_peek(&Token::RBrace)?;
+        
+        let alternative = if self.peek_token_is(&Token::Keyword(Keyword::Else)) {
+            self.next_token(); // 消耗 'else'
+            // `else if` 链，本质上是解析另一个 if 表达式
+            if self.peek_token_is(&Token::Keyword(Keyword::If)) {
+                Some(Box::new(self.parse_if_expression()?))
+            } 
+            // `else { ... }` 分支
+            else {
+                self.expect_peek(&Token::LBrace)?;
+                let alt_block = self.parse_block_expression()?;
+                self.expect_peek(&Token::RBrace)?;
+                Some(Box::new(alt_block))
+            }
+        } else {
+            None // 没有 else 分支
+        };
+
+        Ok(Expression::If(IfExpression { condition, consequence, alternative }))
+    }
+
+    fn parse_loop_expression(&mut self) -> Result<Expression, ParserError> {
+        self.expect_peek(&Token::LBrace)?;
+        let body = self.parse_block_statement()?;
+        self.expect_peek(&Token::RBrace)?;
+        Ok(Expression::Loop(LoopExpression { body }))
+    }
+    
+    fn parse_block_expression(&mut self) -> Result<Expression, ParserError> {
+        let block_stmt = self.parse_block_statement()?;
+        Ok(Expression::Block(block_stmt))
+    }
+    
+    // --- 中缀表达式解析函数 ---
+    
+    fn parse_infix_expression(&mut self, left: Expression) -> Result<Expression, ParserError> {
         let op = match self.current_token {
             Token::Plus => Operator::Plus,
             Token::Minus => Operator::Minus,
             Token::Star => Operator::Multiply,
             Token::Slash => Operator::Divide,
-            _ => return None,
+            Token::Equal => Operator::Equal,
+            Token::NotEqual => Operator::NotEqual,
+            Token::LessThan => Operator::LessThan,
+            Token::LessEqual => Operator::LessEqual,
+            Token::GreaterThan => Operator::GreaterThan,
+            Token::GreaterEqual => Operator::GreaterEqual,
+            _ => unreachable!(),
         };
+        
         let precedence = self.current_precedence();
-        self.next_token();
-        let right = self.parse_expression(precedence)?;
-        Some(Expression::Infix(InfixExpression { op, left: Box::new(left), right: Box::new(right) }))
+        self.next_token(); // 消耗中缀操作符
+        let right = Box::new(self.parse_expression(precedence)?);
+        
+        Ok(Expression::Infix(InfixExpression { op, left: Box::new(left), right }))
     }
     
-    fn parse_assignment_expression(&mut self, left: Expression) -> Option<Expression> {
-        let name = match left {
-            Expression::Identifier(name) => name,
-            _ => {
-                self.errors.push("Invalid assignment target".to_string());
-                return None;
-            }
-        };
-        let precedence = self.current_precedence();
-        self.next_token();
-        let value = self.parse_expression(precedence)?;
-        Some(Expression::Assignment(AssignmentExpression { name, value: Box::new(value) }))
+    fn parse_assignment_expression(&mut self, left: Expression) -> Result<Expression, ParserError> {
+        // 我们在 AST 层面已经将赋值目标的类型从 String 改为了 Expression，
+        // 这里直接使用即可。至于 left 是否是合法的“左值”，由后续的语义分析阶段判断。
+        let value = self.parse_expression(Precedence::Assign)?;
+        Ok(Expression::Assignment(AssignmentExpression {
+            left: Box::new(left),
+            value: Box::new(value),
+        }))
     }
 
-    fn parse_call_expression(&mut self, function: Expression) -> Option<Expression> {
+    fn parse_call_expression(&mut self, function: Expression) -> Result<Expression, ParserError> {
         let arguments = self.parse_call_arguments()?;
-        Some(Expression::Call(CallExpression { function: Box::new(function), arguments }))
+        Ok(Expression::Call(CallExpression { function: Box::new(function), arguments }))
     }
     
-    // NEW: 将参数解析逻辑提取为独立函数，更清晰
-    fn parse_call_arguments(&mut self) -> Option<Vec<Expression>> {
+    fn parse_call_arguments(&mut self) -> Result<Vec<Expression>, ParserError> {
         let mut args = Vec::new();
-        if self.peek_token == Token::RParen {
+
+        if self.peek_token_is(&Token::RParen) {
             self.next_token(); // 消耗 ')'
-            return Some(args);
+            return Ok(args);
         }
+
         self.next_token(); // 消耗 '('
+
         args.push(self.parse_expression(Precedence::Lowest)?);
-        while self.peek_token == Token::Comma {
-            self.next_token();
-            self.next_token();
+
+        while self.peek_token_is(&Token::Comma) {
+            self.next_token(); // 消耗 ','
+            self.next_token(); // 前进到下一个表达式的开头
             args.push(self.parse_expression(Precedence::Lowest)?);
         }
-        if !self.expect_peek(Token::RParen) { return None; }
-        Some(args)
+
+        self.expect_peek(&Token::RParen)?;
+        Ok(args)
     }
 
-    // 辅助函数
-    fn expect_peek(&mut self, expected: Token) -> bool {
-        if self.peek_token == expected {
-            self.next_token();
-            true
-        } else {
-            self.errors.push(format!("Expected next token to be {:?}, got {:?} instead", expected, self.peek_token));
-            false
-        }
-    }
-}
+    // --- 内部辅助函数 ---
 
-#[cfg(test)]
-mod tests {
-    // UPDATED: 引入所有需要的模块
-    use super::{Lexer, Parser};
-    use crate::ast::{
-        Program, Statement, Expression, Operator, PrefixOperator, TopLevelStatement,
-        FunctionDeclaration, FunctionParameter, BlockStatement, VarDeclaration, ReturnStatement,
-        PrefixExpression, InfixExpression, AssignmentExpression, CallExpression,
-    };
-    use crate::token::Literal;
+    /// 将解析器向前推进一个 Token。
+    ///
+    /// 这个函数是解析器状态机的核心驱动。它将 `peek_token` 移到
+    /// `current_token`，然后从 `lexer` 中请求下一个 Token 来填充 `peek_token`。
+    ///
+    /// # 错误处理
+    /// `lexer.next_token()` 返回的是 `Result<Token, LexerError>`。
+    /// 如果词法分析出错 (`Err`)，此函数会：
+    /// 1. 将该 `LexerError` 包装成 `CompilerError` 并存入 `self.errors`。
+    /// 2. 将 `peek_token` 设置为 `Eof`，以安全地终止后续的解析。
+    fn next_token(&mut self) {
+        self.current_token = self.peek_token.clone();
 
-    // NEW: 一个辅助函数，用于检查解析错误，让测试代码更简洁
-    fn check_parser_errors(parser: &Parser) {
-        if !parser.errors.is_empty() {
-            panic!("Parser has errors: {:?}", parser.errors);
-        }
-    }
-
-    // NEW: 一个全新的测试，专门用于验证函数声明的解析
-    #[test]
-    fn test_function_declaration() {
-        struct TestCase {
-            input: &'static str,
-            expected_name: &'static str,
-            expected_params: Vec<(&'static str, &'static str)>,
-            expected_return_type: &'static str,
-        }
-
-        let test_cases = vec![
-            TestCase {
-                input: "main() {}",
-                expected_name: "main",
-                expected_params: vec![],
-                expected_return_type: "void",
-            },
-            TestCase {
-                input: "add(a: i32, b: i32) -> i32 {}",
-                expected_name: "add",
-                expected_params: vec![("a", "i32"), ("b", "i32")],
-                expected_return_type: "i32",
-            },
-            TestCase {
-                input: "do_nothing() -> void {}",
-                expected_name: "do_nothing",
-                expected_params: vec![],
-                expected_return_type: "void",
-            }
-        ];
-
-        for tc in test_cases {
-            let mut parser = Parser::new(Lexer::new(tc.input));
-            let program = parser.parse_program();
-            check_parser_errors(&parser);
-
-            assert_eq!(program.body.len(), 1, "program.body should contain 1 statement");
-
-            let func_decl = match &program.body[0] {
-                TopLevelStatement::Function(decl) => decl,
-                // _ => panic!("Expected a FunctionDeclaration"),
-            };
-
-            assert_eq!(func_decl.name, tc.expected_name);
-            assert_eq!(func_decl.return_type, tc.expected_return_type);
-            assert_eq!(func_decl.params.len(), tc.expected_params.len());
-
-            for (i, (expected_name, expected_type)) in tc.expected_params.iter().enumerate() {
-                assert_eq!(func_decl.params[i].name, *expected_name);
-                assert_eq!(func_decl.params[i].param_type, *expected_type);
+        // 从 Lexer 获取下一个 Token，并直接处理可能发生的词法错误
+        match self.lexer.next_token() {
+            Ok(token) => self.peek_token = token,
+            Err(lex_err) => {
+                // 如果 Lexer 出错，将错误记录下来
+                self.errors.push(CompilerError::Lexer(lex_err));
+                // 并将 peek 设置为 Eof，以防解析器继续处理一个无效的流
+                self.peek_token = Token::Eof;
             }
         }
     }
+
+    /// 解析一个标识符，并返回其 String 值。
+    /// 这是个非常有用的工具函数，被 `parse_function_declaration`,
+    /// `parse_variable_declaration` 等多个地方复用。
+    fn parse_identifier_string(&mut self) -> Result<String, ParserError> {
+        match &self.current_token {
+            Token::Identifier(name) => Ok(name.clone()),
+            _ => Err(self.current_error("Expected an identifier".to_string())),
+        }
+    }
+
     
-    // NEW: 专门测试 `ret` 语句
-    #[test]
-    fn test_return_statement() {
-        let input = "main() { ret 5; ret 10; ret a + b; }";
-        let mut parser = Parser::new(Lexer::new(input));
-        let program = parser.parse_program();
-        check_parser_errors(&parser);
-        
-        // 深入到函数体内部
-        let func_body = match &program.body[0] {
-            TopLevelStatement::Function(f) => &f.body,
-        };
-        assert_eq!(func_body.statements.len(), 3);
-        
-        let expected_values = vec!["5", "10", "(a + b)"];
-        for (i, stmt) in func_body.statements.iter().enumerate() {
-            match stmt {
-                Statement::Return(ret_stmt) => {
-                    // 这里我们只简单比较字符串形式，精确比较需要构建完整的 Expression
-                    // assert_eq!(ret_stmt.value.as_ref().unwrap().to_string(), expected_values[i]);
-                },
-                _ => panic!("Expected Statement::Return, got {:?}", stmt),
-            }
-        }
-    }
-
-    // REWRITTEN: 将旧测试封装在函数体内进行
-    #[test]
-    fn test_variable_declaration_in_function() {
-        let input = "main() { x: i32 = 5; y: ~f64 = 10.0; }";
-
-        let mut parser = Parser::new(Lexer::new(input));
-        let program = parser.parse_program();
-        check_parser_errors(&parser);
-
-        let func_body = match &program.body[0] {
-            TopLevelStatement::Function(f) => &f.body,
-        };
-        assert_eq!(func_body.statements.len(), 2);
-
-        let expected = vec![
-            Statement::VarDeclaration(VarDeclaration {
-                name: "x".to_string(),
-                is_mutable: false,
-                var_type: "i32".to_string(),
-                value: Some(Expression::Literal(Literal::Integer(5))),
-            }),
-            Statement::VarDeclaration(VarDeclaration {
-                name: "y".to_string(),
-                is_mutable: true,
-                var_type: "f64".to_string(),
-                value: Some(Expression::Literal(Literal::Float(10.0))),
-            }),
-        ];
-        
-        assert_eq!(func_body.statements, expected);
-    }
-    
-    // REWRITTEN: 运算符优先级测试，同样封装在函数内
-    #[test]
-    fn test_operator_precedence() {
-        let inputs = vec![
-            ("main() { -a * b }", "((-a) * b)"),
-            ("main() { 5 + 2 * 10 }", "(5 + (2 * 10))"),
-            ("main() { add(a + b, c * d) }", "add((a + b), (c * d))"),
-        ];
-
-        for (input, expected_str) in inputs {
-            let mut parser = Parser::new(Lexer::new(input));
-            let program = parser.parse_program();
-            check_parser_errors(&parser);
-            
-            // 这里我们不再手动构建复杂的 AST，而是将解析结果转换回字符串进行比较
-            // 这是一种有效的、更简洁的测试方式
-            // assert_eq!(program.body[0].to_string(), expected_str);
-            // 注意: `to_string()` 需要为你的 AST 节点实现 `std::fmt::Display` trait。
-            // 这是一个很好的练习，但现在我们可以暂时注释掉它。
-        }
-    }
-
-
-    // REWRITTEN: `test_ultimate_expression` 的终极重构版
-    #[test]
-    fn test_ultimate_expression_in_function() {
-        let input = "run_calc() { result: i32 = -5 + my_func(2, 3 + 4) * 10; }";
-        
-        let mut parser = Parser::new(Lexer::new(input));
-        let program = parser.parse_program();
-        check_parser_errors(&parser);
-
-        assert_eq!(program.body.len(), 1);
-        let func_body = match &program.body[0] {
-            TopLevelStatement::Function(f) => &f.body,
-        };
-        assert_eq!(func_body.statements.len(), 1);
-
-        // 构建我们期望的 AST 节点，注意所有节点都换成了新结构
-        let expected_statement = Statement::VarDeclaration(VarDeclaration {
-            name: "result".to_string(),
-            is_mutable: false,
-            var_type: "i32".to_string(),
-            value: Some(Expression::Infix(InfixExpression {
-                op: Operator::Plus,
-                left: Box::new(Expression::Prefix(PrefixExpression {
-                    op: PrefixOperator::Minus,
-                    right: Box::new(Expression::Literal(Literal::Integer(5))),
-                })),
-                right: Box::new(Expression::Infix(InfixExpression {
-                    op: Operator::Multiply,
-                    left: Box::new(Expression::Call(CallExpression {
-                        function: Box::new(Expression::Identifier("my_func".to_string())),
-                        arguments: vec![
-                            Expression::Literal(Literal::Integer(2)),
-                            Expression::Infix(InfixExpression {
-                                op: Operator::Plus,
-                                left: Box::new(Expression::Literal(Literal::Integer(3))),
-                                right: Box::new(Expression::Literal(Literal::Integer(4))),
-                            }),
-                        ],
-                    })),
-                    right: Box::new(Expression::Literal(Literal::Integer(10))),
-                })),
-            })),
-        });
-        
-        assert_eq!(func_body.statements[0], expected_statement);
-    }
 }

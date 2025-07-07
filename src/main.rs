@@ -6,10 +6,11 @@ mod lexer;
 mod ast;
 mod parser;
 mod types;
-mod semantic;
+mod scope;
 mod analyzer;
 mod error;
 mod codegen;
+mod diagnostics;
 
 use inkwell::context::Context;
 use lexer::Lexer;
@@ -20,17 +21,30 @@ use codegen::CodeGen;
 use std::path::Path;
 
 fn main() {
-    // 我们的 Tipy 源代码
+    // UPDATED: 使用新的 Tipy 源代码来测试 v0.0.4 的控制流功能
     let input = r#"
-        add(a: i32, b: i32) -> i32 {
-            ret a + b
+        // 一个使用 if-else 表达式的函数
+        max(a: i32, b: i32) -> i32 {
+            if a > b {
+                a // if 块的隐式返回
+            } else {
+                b // else 块的隐式返回
+            }
         }
 
         main() -> i32 {
-            a: i32 = 10;
-            b: ~i32 = 20;
-            b = add(a, b * 2); // 应计算为 add(10, 40) = 50
-            ret b;
+            // 测试 if-else
+            result: i32 = max(100, 50); // 应该得到 100
+
+            // 测试 while 循环
+            counter: ~i32 = 0;
+            while counter < 5 {
+                counter = counter + 1;
+            }
+            
+            // result 应该是 100, counter 应该是 5
+            // 最终返回 105
+            ret result + counter;
         }
     "#;
 
@@ -86,10 +100,12 @@ fn main() {
             } else {
                 println!("\nIR saved to output.ll");
                 println!("Run the following commands to create an executable:");
+                // 注意：请确保你的系统上安装了与 inkwell 匹配的 llc 和 clang 版本
                 println!("  llc-18 -filetype=obj -relocation-model=pic -o output.o output.ll");
-                println!("  clang output.o -o my_program");
+                println!("  clang-18 output.o -o my_program");
                 println!("  ./my_program");
-                println!("  echo $?  # Should print 50 on Linux/macOS");
+                // UPDATED: 期望的返回码现在是 105
+                println!("  echo $?  # Should print 105 on Linux/macOS");
             }
         },
         Err(e) => {

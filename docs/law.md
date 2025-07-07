@@ -109,6 +109,7 @@
     ```tipy
     value: i32 = if condition { 1 } else { 0 }
     ```
+    链式调用则为 `if-elif-else`
   * **6.2. `loop`:** 无限循环，必须由 `break` 退出。`break` 可以带一个值作为 `loop` 表达式的返回值。
     ```tipy
     counter: ~i32 = 0

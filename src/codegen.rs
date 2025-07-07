@@ -7,8 +7,8 @@ use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::values::{FunctionValue, PointerValue, BasicValueEnum, BasicMetadataValueEnum};
 use inkwell::types::{BasicTypeEnum, BasicType};
-use inkwell::AddressSpace;
-use crate::ast::{Program, TopLevelStatement, FunctionDeclaration, Statement, Expression};
+use inkwell::{AddressSpace, IntPredicate, FloatPredicate};
+use crate::ast::{Program, TopLevelStatement, FunctionDeclaration, Statement, Expression, BlockStatement, IfExpression, WhileStatement, LoopExpression};
 use crate::types::Type as TipyType;
 use crate::error::CompileError;
 
@@ -17,11 +17,11 @@ pub struct CodeGen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
-
-    /// 使用一个 Vec/栈来管理作用域，支持嵌套。
-    /// 元组中存储 (变量的栈地址, 变量的LLVM基本类型)。
     variables: Vec<HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>>,
     current_function: Option<FunctionValue<'ctx>>,
+    // NEW: 循环上下文栈，用于处理 break/continue
+    // 元组: (循环继续的目的地 BasicBlock, 循环退出的目的地 BasicBlock)
+    loop_context_stack: Vec<(inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)>,
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -31,8 +31,9 @@ impl<'ctx> CodeGen<'ctx> {
             context,
             module: context.create_module(module_name),
             builder: context.create_builder(),
-            variables: vec![HashMap::new()], // 初始化时带一个全局作用域
+            variables: vec![HashMap::new()],
             current_function: None,
+            loop_context_stack: Vec::new(), // NEW: 初始化
         }
     }
 
@@ -80,7 +81,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// 第一遍：只声明函数签名，不编译函数体
-    fn compile_function_declaration(&self, func_decl: &FunctionDeclaration, symbol_table: &crate::semantic::SymbolTable) -> Result<(), CompileError> {
+    fn compile_function_declaration(&self, func_decl: &FunctionDeclaration, symbol_table: &crate::scope::SymbolTable) -> Result<(), CompileError> {
         let func_symbol = symbol_table.lookup(&func_decl.name).ok_or_else(|| CompileError::Semantic("Function not found in symbol table".to_string()))?;
 
         if let TipyType::Function { params, ret } = &func_symbol.symbol_type {
@@ -138,6 +139,7 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
     
+    // UPDATED: `compile_statement` 调度所有新语句
     fn compile_statement(&mut self, stmt: &Statement) -> Result<(), CompileError> {
         match stmt {
             Statement::VarDeclaration(var_decl) => self.compile_var_declaration(var_decl),
@@ -147,20 +149,35 @@ impl<'ctx> CodeGen<'ctx> {
                     None => None,
                 };
                 self.builder.build_return(ret_val.as_ref().map(|v| v as &dyn inkwell::values::BasicValue))?;
-                Ok(())
+                Ok(()) 
             },
             Statement::Expression(expr) => self.compile_expression(expr).map(|_| ()),
-            Statement::Block(block_stmt) => self.compile_block_statement(block_stmt),
+            Statement::Block(block_stmt) => self.compile_block_statement(block_stmt).map(|_| ()), // 忽略块返回值
+            // NEW: 调度新的控制流语句
+            Statement::While(while_stmt) => self.compile_while_statement(while_stmt),
+            Statement::Break(_) => self.compile_break_statement(),
+            Statement::Continue(_) => self.compile_continue_statement(),
         }
     }
 
-    fn compile_block_statement(&mut self, block: &crate::ast::BlockStatement) -> Result<(), CompileError> {
+    // UPDATED: `compile_block_statement` 现在能返回块的值，用于 if/loop 表达式
+    fn compile_block_statement(&mut self, block: &BlockStatement) -> Result<Option<BasicValueEnum<'ctx>>, CompileError> {
         self.enter_scope();
-        for stmt in &block.statements {
-            self.compile_statement(stmt)?;
+        let mut last_val = None;
+        for (i, stmt) in block.statements.iter().enumerate() {
+            // 如果是块中最后一个语句，并且是表达式语句，我们认为它是块的返回值
+            if i == block.statements.len() - 1 {
+                if let Statement::Expression(expr) = stmt {
+                    last_val = Some(self.compile_expression(expr)?);
+                } else {
+                    self.compile_statement(stmt)?;
+                }
+            } else {
+                self.compile_statement(stmt)?;
+            }
         }
         self.leave_scope();
-        Ok(())
+        Ok(last_val)
     }
 
     fn compile_expression(&mut self, expr: &Expression) -> Result<BasicValueEnum<'ctx>, CompileError> {
@@ -180,23 +197,24 @@ impl<'ctx> CodeGen<'ctx> {
                 if left.is_int_value() && right.is_int_value() {
                     let l = left.into_int_value();
                     let r = right.into_int_value();
-                    let result = match infix_expr.op {
-                        crate::ast::Operator::Plus => self.builder.build_int_add(l, r, "tmpadd"),
-                        crate::ast::Operator::Minus => self.builder.build_int_sub(l, r, "tmpsub"),
-                        crate::ast::Operator::Multiply => self.builder.build_int_mul(l, r, "tmpmul"),
-                        crate::ast::Operator::Divide => self.builder.build_int_signed_div(l, r, "tmpdiv"),
-                    }?;
-                    Ok(result.into())
+                    // UPDATED: 使用 match 匹配所有运算符
+                    match infix_expr.op {
+                        // 算术
+                        crate::ast::Operator::Plus => Ok(self.builder.build_int_add(l, r, "add")?.into()),
+                        crate::ast::Operator::Minus => Ok(self.builder.build_int_sub(l, r, "sub")?.into()),
+                        crate::ast::Operator::Multiply => Ok(self.builder.build_int_mul(l, r, "mul")?.into()),
+                        crate::ast::Operator::Divide => Ok(self.builder.build_int_signed_div(l, r, "div")?.into()),
+                        // NEW: 比较
+                        crate::ast::Operator::Equal => Ok(self.builder.build_int_compare(IntPredicate::EQ, l, r, "eq")?.into()),
+                        crate::ast::Operator::NotEqual => Ok(self.builder.build_int_compare(IntPredicate::NE, l, r, "ne")?.into()),
+                        crate::ast::Operator::LessThan => Ok(self.builder.build_int_compare(IntPredicate::SLT, l, r, "lt")?.into()),
+                        crate::ast::Operator::LessEqual => Ok(self.builder.build_int_compare(IntPredicate::SLE, l, r, "le")?.into()),
+                        crate::ast::Operator::GreaterThan => Ok(self.builder.build_int_compare(IntPredicate::SGT, l, r, "gt")?.into()),
+                        crate::ast::Operator::GreaterEqual => Ok(self.builder.build_int_compare(IntPredicate::SGE, l, r, "ge")?.into()),
+                    }
                 } else if left.is_float_value() && right.is_float_value() {
-                    let l = left.into_float_value();
-                    let r = right.into_float_value();
-                    let result = match infix_expr.op {
-                        crate::ast::Operator::Plus => self.builder.build_float_add(l, r, "tmpfadd"),
-                        crate::ast::Operator::Minus => self.builder.build_float_sub(l, r, "tmpfsub"),
-                        crate::ast::Operator::Multiply => self.builder.build_float_mul(l, r, "tmpfmul"),
-                        crate::ast::Operator::Divide => self.builder.build_float_div(l, r, "tmpfdiv"),
-                    }?;
-                    Ok(result.into())
+                    // ... 类似地，为浮点数添加 build_float_compare ...
+                    unimplemented!("Float comparisons not implemented yet")
                 } else {
                     Err(CompileError::Semantic("Mismatched types in binary operation.".to_string()))
                 }
@@ -250,9 +268,20 @@ impl<'ctx> CodeGen<'ctx> {
                         } else {
                             Err(CompileError::Semantic("Unary minus can only be applied to numbers.".to_string()))
                         }
+                    },
+                    // NEW: 逻辑非 `!`
+                    crate::ast::PrefixOperator::Not => {
+                        let bool_true = self.context.bool_type().const_int(1, false);
+                        let result = self.builder.build_xor(value.into_int_value(), bool_true, "not")?;
+                        Ok(result.into())
                     }
                 }
-            }
+            },
+
+            // --- NEW: 新增控制流表达式的编译 ---
+            Expression::If(if_expr) => self.compile_if_expression(if_expr),
+            Expression::Loop(loop_expr) => self.compile_loop_expression(loop_expr),
+            Expression::Block(block_stmt) => self.compile_block_statement(block_stmt)?.ok_or_else(|| CompileError::Semantic("Block used as expression did not return a value".to_string())),
         }
     }
     
@@ -268,6 +297,96 @@ impl<'ctx> CodeGen<'ctx> {
         self.builder.build_store(alloca, initial_value)?;
         self.variables.last_mut().unwrap().insert(var_decl.name.clone(), (alloca, var_type));
         Ok(())
+    }
+
+    // --- NEW: 所有新增功能的代码生成函数 ---
+    
+    fn compile_if_expression(&mut self, if_expr: &IfExpression) -> Result<BasicValueEnum<'ctx>, CompileError> {
+        let function = self.current_function.unwrap();
+
+        // 1. 编译条件
+        let cond_val = self.compile_expression(&if_expr.condition)?;
+        let cond = self.builder.build_int_compare(IntPredicate::NE, cond_val.into_int_value(), self.context.bool_type().const_int(0, false), "ifcond")?;
+
+        // 2. 创建基本块
+        let then_bb = self.context.append_basic_block(function, "then");
+        let else_bb = self.context.append_basic_block(function, "else");
+        let merge_bb = self.context.append_basic_block(function, "ifcont");
+
+        // 3. 创建条件分支
+        self.builder.build_conditional_branch(cond, then_bb, else_bb)?;
+
+        // 4. 编译 then 块
+        self.builder.position_at_end(then_bb);
+        let then_val = self.compile_block_statement(&if_expr.consequence)?.unwrap(); // 假设 if 作为表达式时，块必有值
+        self.builder.build_unconditional_branch(merge_bb)?;
+        let then_bb = self.builder.get_insert_block().unwrap(); // 获取 then 块的最终位置
+
+        // 5. 编译 else 块
+        self.builder.position_at_end(else_bb);
+        let else_val = self.compile_expression(if_expr.alternative.as_ref().unwrap())?; // 假设 if 作为表达式时必有 else
+        self.builder.build_unconditional_branch(merge_bb)?;
+        let else_bb = self.builder.get_insert_block().unwrap();
+
+        // 6. 在 merge 块中使用 PHI 节点汇集结果
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.build_phi(then_val.get_type(), "iftmp")?;
+        phi.add_incoming(&[(&then_val, then_bb), (&else_val, else_bb)]);
+
+        Ok(phi.as_basic_value())
+    }
+
+    fn compile_while_statement(&mut self, while_stmt: &WhileStatement) -> Result<(), CompileError> {
+        let function = self.current_function.unwrap();
+        
+        let cond_bb = self.context.append_basic_block(function, "loopcond");
+        let body_bb = self.context.append_basic_block(function, "loopbody");
+        let after_bb = self.context.append_basic_block(function, "afterloop");
+        
+        // break/continue 跳转的目标
+        self.loop_context_stack.push((cond_bb, after_bb));
+        
+        self.builder.build_unconditional_branch(cond_bb)?;
+        
+        // 编译条件块
+        self.builder.position_at_end(cond_bb);
+        let cond_val = self.compile_expression(&while_stmt.condition)?;
+        let cond = self.builder.build_int_compare(IntPredicate::NE, cond_val.into_int_value(), self.context.bool_type().const_int(0, false), "whilecond")?;
+        self.builder.build_conditional_branch(cond, body_bb, after_bb)?;
+        
+        // 编译循环体
+        self.builder.position_at_end(body_bb);
+        self.compile_block_statement(&while_stmt.body)?;
+        self.builder.build_unconditional_branch(cond_bb)?; // 循环体结束后跳回条件判断
+        
+        // 编译循环结束后的代码
+        self.builder.position_at_end(after_bb);
+        self.loop_context_stack.pop();
+        Ok(())
+    }
+
+    fn compile_loop_expression(&mut self, loop_expr: &LoopExpression) -> Result<BasicValueEnum<'ctx>, CompileError> {
+        // ... `loop` 的实现与 `while` 类似，但更简单，因为它没有条件块，直接进入循环体
+        // `break` 可以带返回值，同样需要使用 PHI 节点
+        unimplemented!("`loop` expression codegen is not implemented yet.");
+    }
+    
+    fn compile_break_statement(&mut self) -> Result<(), CompileError> {
+        if let Some((_, break_bb)) = self.loop_context_stack.last() {
+            self.builder.build_unconditional_branch(*break_bb)?;
+            Ok(())
+        } else {
+            Err(CompileError::Semantic("`break` used outside of a loop".to_string()))
+        }
+    }
+
+    fn compile_continue_statement(&mut self) -> Result<(), CompileError> {
+        if let Some((continue_bb, _)) = self.loop_context_stack.last() {
+            self.builder.build_unconditional_branch(*continue_bb)?;
+            Ok(())
+        } else {
+            Err(CompileError::Semantic("`continue` used outside of a loop".to_string()))
+        }
     }
 
     // --- 辅助函数 ---
@@ -291,12 +410,13 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(builder.build_alloca(ty, name)?)
     }
     
-    /// 将我们自己的 TipyType 转换为 LLVM 的 BasicTypeEnum
+    // UPDATED: `to_llvm_basic_type` 支持 bool
     fn to_llvm_basic_type(&self, tipy_type: &TipyType) -> BasicTypeEnum<'ctx> {
         match tipy_type {
             TipyType::Int32 => self.context.i32_type().into(),
             TipyType::Float64 => self.context.f64_type().into(),
-            _ => unimplemented!("Type conversion to LLVM type not implemented for this TipyType."),
+            TipyType::Bool => self.context.bool_type().into(), // <-- 新增
+            _ => unimplemented!("Type conversion not implemented for this TipyType."),
         }
     }
     

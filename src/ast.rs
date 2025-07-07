@@ -35,6 +35,12 @@ pub enum Statement {
     Return(ReturnStatement),
     /// 代码块, e.g., `{ ... }`
     Block(BlockStatement),
+    /// while 循环语句, e.g., `while condition { ... }`
+    While(WhileStatement),
+    /// break 语句, e.g., `break;` or `break value;`
+    Break(BreakStatement),
+    /// continue 语句, e.g., `continue;`
+    Continue(ContinueStatement),
 }
 
 // 表达式 (Expression) - 可以被求值的代码片段，总会产生一个值。
@@ -52,8 +58,12 @@ pub enum Expression {
     Assignment(AssignmentExpression),
     /// 函数调用表达式, e.g., `add(1, 2)`
     Call(CallExpression),
-    // Future: If(IfExpression),
-    // Future: Loop(LoopExpression),
+    /// if-elif-else 表达式, e.g., `if condition { ... } else { ... }`
+    If(IfExpression),
+    /// loop 表达式, e.g., `loop { ... }`
+    Loop(LoopExpression),
+    /// 代码块本身也可以是一个表达式，其值为块中最后一条表达式的值
+    Block(BlockStatement),
 }
 
 // --- 具体的 AST 节点定义 ---
@@ -119,7 +129,7 @@ pub struct InfixExpression {
 /// 赋值表达式节点
 #[derive(Debug, PartialEq, Clone)]
 pub struct AssignmentExpression {
-    pub name: String,
+    pub left: Box<Expression>, 
     pub value: Box<Expression>,
 }
 
@@ -131,19 +141,62 @@ pub struct CallExpression {
     pub arguments: Vec<Expression>,
 }
 
+/// If 表达式节点
+/// e.g., `if condition { ... } else { ... }`
+/// `elif` 会被解析为嵌套的 IfExpression，放在 alternative 字段中。
+#[derive(Debug, PartialEq, Clone)]
+pub struct IfExpression {
+    pub condition: Box<Expression>,
+    pub consequence: BlockStatement,
+    // `else` 分支是可选的。如果存在，它也是一个表达式。
+    // 这允许 `else if ...` 链式结构。
+    pub alternative: Option<Box<Expression>>, 
+}
+
+/// loop 表达式节点
+#[derive(Debug, PartialEq, Clone)]
+pub struct LoopExpression {
+    pub body: BlockStatement,
+}
+
+/// while 语句节点
+#[derive(Debug, PartialEq, Clone)]
+pub struct WhileStatement {
+    pub condition: Expression,
+    pub body: BlockStatement,
+}
+
+/// break 语句节点
+#[derive(Debug, PartialEq, Clone)]
+pub struct BreakStatement {
+    // `break;` -> None, `break value;` -> Some(value)
+    pub value: Option<Expression>,
+}
+
+/// continue 语句节点 (它没有额外数据)
+#[derive(Debug, PartialEq, Clone)]
+pub struct ContinueStatement;
+
 // --- 操作符枚举 ---
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Operator {
+    // 算术
     Plus,
     Minus,
     Multiply,
     Divide,
-    // Future: Equal, NotEqual, LessThan, etc.
+    // 比较
+    Equal,        // ==
+    NotEqual,     // !=
+    LessThan,     // <
+    LessEqual,    // <=
+    GreaterThan,  // >
+    GreaterEqual, // >=
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PrefixOperator {
-    Minus,
-    // Future: Not,
+    Minus, // -
+    Not,   // !
 }

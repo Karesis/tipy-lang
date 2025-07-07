@@ -1,43 +1,76 @@
-/// 代表 Tipy 语言在语义分析阶段的内部类型表示。
-#[derive(Debug, Clone, PartialEq)]
-pub enum Type {
-    Int32,
-    Float64,
-    // ... 未来可以加入 Bool, String, etc.
+// file: src/types.rs
 
-    /// 代表一个函数类型。
+use std::fmt;
+
+/// 代表 Tipy 语言在语义分析阶段的内部类型表示。
+///
+/// 这是类型的“范畴”或“模板”，而不是具体的值。
+/// 例如，`Type::I32` 代表了所有32位有符号整数的类型。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // <-- Eq 和 Hash 在未来使用 HashMap<Type, ...> 时会很有用
+pub enum Type {
+    // --- 原生类型 ---
+    I8, I16, I32, I64, I128, Isize,
+    U8, U16, U32, U64, U128, Usize,
+    F32, F64,
+    Bool,
+    Char,
+    /// 内置的、拥有所有权的字符串类型。
+    Str,
+
+    // --- 复合类型 ---
+    /// 指针类型
+    Pointer {
+        /// 指针本身是否可变 (`~^T`)
+        is_mutable_ptr: bool,
+        /// 指针指向的数据是否可变 (`^~T`)
+        is_mutable_pointee: bool,
+        /// 指向的类型
+        pointee: Box<Type>,
+    },
+    /// 函数类型
     Function {
-        /// 参数类型的列表。
         params: Vec<Type>,
-        /// 返回类型。对于不返回值的函数，这里是 Box<Type::Void>。
-        /// 使用 Box 是因为类型定义是递归的，需要一个间接层。
         ret: Box<Type>,
     },
 
-    /// 代表没有值的类型，主要用于函数返回值。
-    Void, 
-    
+    // --- 用户自定义类型 (为未来预留) ---
+    Struct { name: String },
+    Enum { name: String },
+
+    // --- 特殊类型 ---
+    /// 代表没有值的类型，通常用作不返回任何东西的函数的返回类型。
+    Void,
     /// 一个特殊的错误类型，用于在类型检查失败时防止连锁错误。
+    /// 当一个表达式的类型无法确定时，可以赋予它此类型，
+    /// 之后所有使用到这个表达式的地方都可以识别出这是一个已知错误，从而避免报告大量无关的后续错误。
     Error,
 }
 
-// (可选) 为 Type 添加一些辅助方法，未来会很方便
-impl Type {
-    /// 用于在日志或错误信息中打印类型名称。
-    pub fn to_string(&self) -> String {
+/// 实现 Display trait，使得类型可以被方便地打印成用户友好的格式。
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Type::Int32 => "i32".to_string(),
-            Type::Float64 => "f64".to_string(),
-            Type::Void => "void".to_string(),
-            Type::Error => "error".to_string(),
-            Type::Function { params, ret } => {
-                let param_types = params
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("fn({}) -> {}", param_types, ret.to_string())
+            Type::I8 => write!(f, "i8"),
+            Type::I32 => write!(f, "i32"),
+            // ... 其他所有原生类型 ...
+            Type::Str => write!(f, "str"),
+            Type::Pointer { is_mutable_ptr, is_mutable_pointee, pointee } => {
+                let mut s = String::new();
+                if *is_mutable_ptr { s.push('~'); }
+                s.push('^');
+                if *is_mutable_pointee { s.push('~'); }
+                write!(f, "{}{}", s, pointee)
             }
+            Type::Function { params, ret } => {
+                let param_types = params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+                write!(f, "fn({}) -> {}", param_types, ret)
+            }
+            Type::Struct { name } => write!(f, "{}", name),
+            Type::Enum { name } => write!(f, "{}", name),
+            Type::Void => write!(f, "void"),
+            Type::Error => write!(f, "<type error>"),
+            // ... 为了简洁，省略了所有原生类型的匹配臂，但实际中应全部实现 ...
+            _ => write!(f, "unimplemented_type"), // 临时占位
         }
     }
 }
