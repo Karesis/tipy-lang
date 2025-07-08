@@ -3,8 +3,11 @@
 use crate::token::Token;
 use crate::types::Type;
 
+use std::fmt; // 引入格式化 trait
+use inkwell::builder::BuilderError;
+
 // --- 统一的编译器错误类型 ---
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub enum CompilerError {
     /// 词法分析器错误
     Lexer(LexerError),
@@ -12,6 +15,19 @@ pub enum CompilerError {
     Parser(ParserError), 
     /// 语意分析错误
     Semantic(SemanticError),
+    /// 代码生成错误
+    Codegen(CodegenError),
+}
+// 为 CompilerError 实现 Display,从而方便打印
+impl fmt::Display for CompilerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompilerError::Lexer(e) => e.fmt(f),
+            CompilerError::Parser(e) => e.fmt(f),
+            CompilerError::Semantic(e) => e.fmt(f),
+            CompilerError::Codegen(e) => e.fmt(f),
+        }
+    }
 }
 
 // --- 词法分析阶段的错误 ---
@@ -36,6 +52,26 @@ pub enum LexerError {
     // --- 为未来准备 ---
     // /// 块注释 /* ... */ 没有找到闭合的 */
     // UnterminatedBlockComment { start_span: Span },
+}
+/// 为LexerError实现方便的打印trait
+impl fmt::Display for LexerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LexerError::UnknownCharacter { char, span } => {
+                write!(f, "Lexical Error: Unknown character '{}' at line {}, column {}.", char, span.line, span.column)
+            }
+            LexerError::UnterminatedString { start_span } => {
+                write!(f, "Lexical Error: Unterminated string starting at line {}, column {}.", start_span.line, start_span.column)
+            }
+            LexerError::MalformedNumberLiteral { reason, span } => {
+                write!(f, "Lexical Error: Malformed number literal '{}' at line {}, column {}.", reason, span.line, span.column)
+            }
+            LexerError::MalformedCharLiteral { span } => {
+                write!(f, "Lexical Error: Malformed character literal at line {}, column {}.", span.line, span.column)
+            }
+            // ... 未来可以添加更多 ...
+        }
+    }
 }
 
 // --- 解析阶段的错误 ---
@@ -63,6 +99,23 @@ pub enum ParserError {
     // 以后可以添加更多，例如：
     // TooManyParameters { span: Span },
     // DuplicateParameterName { name: String, span: Span },
+}
+/// 为ParserError实现方便的打印trait
+impl fmt::Display for ParserError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParserError::UnexpectedToken { expected, found, span } => {
+                write!(f, "Syntax Error: Expected {}, but found {:?} at line {}, column {}.", expected, found, span.line, span.column)
+            }
+            ParserError::UnexpectedEof { expected } => {
+                write!(f, "Syntax Error: Unexpected end of file. Expected {}.", expected)
+            }
+            ParserError::InvalidAssignmentTarget { span } => {
+                write!(f, "Syntax Error: Invalid assignment target at line {}, column {}. You can only assign to variables.", span.line, span.column)
+            }
+            // ... 未来可以添加更多 ...
+        }
+    }
 }
 
 // --- NEW: 语义分析阶段的错误 ---
@@ -112,6 +165,108 @@ pub enum SemanticError {
     /// 无效的赋值目标。
     /// e.g., `5 = x;` 或 `(a+b) = c;`
     InvalidAssignmentTarget { span: Span },
+
+    /// 运算符无法应用于给定的类型。
+    /// e.g., `!10` (逻辑非不能用于整数) or `-true` (负号不能用于布尔值)
+    InvalidOperatorForType {
+        operator: String,
+        the_type: Type, // a more neutral name than 'found'
+        span: Span,
+    },
+}
+/// 为SemanticError实现方便的打印trait
+impl fmt::Display for SemanticError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SemanticError::SymbolAlreadyDefined { name, span } => {
+                write!(f, "Semantic Error: Symbol '{}' is already defined in this scope. (at line {})", name, span.line)
+            }
+            SemanticError::SymbolNotFound { name, span } => {
+                write!(f, "Semantic Error: Use of undefined symbol '{}' at line {}.", name, span.line)
+            }
+            SemanticError::TypeMismatch { expected, found, span } => {
+                write!(f, "Semantic Error: Type mismatch at line {}. Expected type '{}', but found '{}'.", span.line, expected, found)
+            }
+            SemanticError::ConditionNotBoolean { found, span } => {
+                write!(f, "Semantic Error: Condition expression must be a boolean, but got '{}' at line {}.", found, span.line)
+            }
+            SemanticError::IllegalBreak { span } => {
+                write!(f, "Semantic Error: 'break' can only be used inside a loop (at line {}).", span.line)
+            }
+            SemanticError::IllegalContinue { span } => {
+                write!(f, "Semantic Error: 'continue' can only be used inside a loop (at line {}).", span.line)
+            }
+            SemanticError::NotAFunction { found, span } => {
+                write!(f, "Semantic Error: Cannot call a non-function type '{}' at line {}.", found, span.line)
+            }
+            SemanticError::ArityMismatch { expected, found, span } => {
+                write!(f, "Semantic Error: Function call at line {} expected {} arguments, but got {}.", span.line, expected, found)
+            }
+            SemanticError::InvalidAssignmentTarget { span } => {
+                write!(f, "Semantic Error: Invalid assignment target at line {}.", span.line)
+            }
+            SemanticError::InvalidOperatorForType { operator, the_type, span } => {
+                write!(f, "Semantic Error: Operator '{}' cannot be applied to type '{}' at line {}.", operator, the_type, span.line)
+            }
+        }
+    }
+}
+
+// --- 代码生成阶段的错误 ---
+#[derive(Debug)] // inkwell 的错误类型不支持 Clone 和 PartialEq，所以我们这里也去掉
+pub enum CodegenError {
+    /// 包装了来自 LLVM 后端 (inkwell) 的底层错误。
+    Backend(BuilderError),
+
+    /// 语义分析阶段本应捕获但遗漏的问题，作为最后的防线。
+    /// 例如，尝试为一个在符号表中找不到的变量生成代码。
+    SymbolNotFound(String),
+
+    /// 尝试为一个非左值（L-Value）的表达式生成赋值操作。
+    /// 例如，`5 = x;`
+    InvalidLValue,
+
+    /// 用于包装一个简单的、基于字符串的错误信息。
+    /// 在某些不值得为其创建一个专属错误类型的场景下非常有用。
+    Message(String),
+
+    // 未来可以添加更多，例如：
+    // UnsupportedExpression(String),
+}
+// 为了能友好地打印错误
+impl fmt::Display for CodegenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CodegenError::Backend(e) => write!(f, "LLVM Backend Error: {}", e),
+            CodegenError::SymbolNotFound(name) => write!(f, "Codegen Error: Symbol '{}' not found.", name),
+            CodegenError::InvalidLValue => write!(f, "Codegen Error: Expression is not a valid L-Value for assignment."),
+            CodegenError::Message(msg) => write!(f, "Codegen Error: {}", msg),
+        }
+    }
+}
+/// 允许 `BuilderError` 自动转换为 `CodegenError`。
+///
+/// 这样，在返回 `Result<_, CodegenError>` 的函数中，
+/// 我们可以对 inkwell 的调用使用 `?`，错误会被自动包装。
+impl From<BuilderError> for CodegenError {
+    fn from(error: BuilderError) -> Self {
+        CodegenError::Backend(error)
+    }
+}
+
+/// 允许任何一种具体的错误类型自动提升为顶层的 `CompilerError`。
+/// 这样，无论在哪个阶段，我们都可以方便地将错误传递出去。
+impl From<LexerError> for CompilerError {
+    fn from(e: LexerError) -> Self { CompilerError::Lexer(e) }
+}
+impl From<ParserError> for CompilerError {
+    fn from(e: ParserError) -> Self { CompilerError::Parser(e) }
+}
+impl From<SemanticError> for CompilerError {
+    fn from(e: SemanticError) -> Self { CompilerError::Semantic(e) }
+}
+impl From<CodegenError> for CompilerError {
+    fn from(e: CodegenError) -> Self { CompilerError::Codegen(e) }
 }
 
 // --- 位置信息 ---

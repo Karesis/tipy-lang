@@ -2,6 +2,9 @@
 
 // --- 模块引入 ---
 
+// 引入字面量用于分析
+use crate::token::Literal;
+
 // 引入诊断模块，用于将分析阶段发现的语义错误添加到错误收集中。
 use crate::diagnostics::{CompilerError, SemanticError, Span};
 
@@ -27,6 +30,9 @@ use crate::ast::{
     IfExpression,
     LoopExpression,
     CallExpression,
+    AssignmentExpression,
+    PrefixExpression,
+    InfixExpression,
 
     // --- 运算符 ---
     Operator,
@@ -361,7 +367,7 @@ impl SemanticAnalyzer {
     }
 
     /// 分析 `loop` 表达式。
-    fn analyze_loop_expression(&mut self, loop_expr: &LoopExpression) -> Result<Type, String> {
+    fn analyze_loop_expression(&mut self, loop_expr: &LoopExpression) -> Result<Type, SemanticError> {
         self.loop_depth += 1;
         
         // TODO: 一个更高级的实现会分析所有 `break value` 语句，
@@ -499,17 +505,30 @@ impl SemanticAnalyzer {
     
     fn analyze_prefix_expression(&mut self, prefix_expr: &PrefixExpression) -> Result<Type, SemanticError> {
         let right_type = self.analyze_expression(&prefix_expr.right)?;
+        
         match prefix_expr.op {
             PrefixOperator::Minus => match right_type {
                 Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::Isize |
                 Type::F32 | Type::F64 => Ok(right_type), // 负号不改变数字类型
-                _ => Err(SemanticError::TypeMismatch { /* ... */ }), // TODO: 构造详细错误
+                _ => {
+                    // FIXED: 使用我们新的、更具体的错误类型
+                    Err(SemanticError::InvalidOperatorForType {
+                        operator: "-".to_string(),
+                        the_type: right_type,
+                        span: Span::default(), // TODO: 从 prefix_expr 获取 Span
+                    })
+                }
             },
             PrefixOperator::Not => {
                 if right_type == Type::Bool {
                     Ok(Type::Bool) // `!` 作用于布尔值，结果仍是布尔值
                 } else {
-                    Err(SemanticError::ConditionNotBoolean { /* ... */ }) // TODO: 构造详细错误
+                    // FIXED: 完整地构造错误
+                    Err(SemanticError::InvalidOperatorForType {
+                        operator: "!".to_string(),
+                        the_type: right_type,
+                        span: Span::default(), // TODO: 从 prefix_expr 获取 Span
+                    })
                 }
             }
         }
